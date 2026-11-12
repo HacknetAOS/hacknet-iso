@@ -199,6 +199,18 @@ if (( LABEL_BAD )); then
 fi
 echo "OK: boot entries use archisolabel=${VOL}"
 
+echo "=== Verifying El Torito boot images (BIOS + UEFI) ==="
+EL_TORITO=$(xorriso -indev "${ISO_FILE}" -report_el_torito 2>&1)
+if ! grep -q "BIOS" <<<"$EL_TORITO"; then
+    echo "ERROR: ISO is missing BIOS El Torito boot image" >&2
+    exit 1
+fi
+if ! grep -q "UEFI" <<<"$EL_TORITO"; then
+    echo "ERROR: ISO is missing UEFI El Torito boot image" >&2
+    exit 1
+fi
+echo "OK: El Torito boot catalog contains both BIOS and UEFI boot images"
+
 echo "=== ISO build complete ==="
 ls -lh "${ISO_FILE}"
 
