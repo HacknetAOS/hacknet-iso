@@ -16,7 +16,3 @@ sudo ./build-iso.sh [output_dir]
 ```
 
 `build-iso.sh` automatically stages packages from `../repo/x86_64/` (or `../packages/pkg-out/`, or the bundled `profile/airootfs/var/cache/pacman/pkg/` cache), builds the image with `mkarchiso`, and verifies both the initramfs (`hooks/archiso` + `/init`) and bootloader `archisolabel` entries before finishing. The GitHub Actions build clones the latest `HacknetAOS/repo` package repository into `../repo` before building, so ISO builds use the latest published HacknetOS packages rather than the bundled fallback cache.
-
-## License
-
-GPL-3.0-or-later
