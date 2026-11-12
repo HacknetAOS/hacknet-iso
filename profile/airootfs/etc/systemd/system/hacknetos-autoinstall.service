@@ -1,0 +1,19 @@
+[Unit]
+Description=HacknetOS unattended installer (only with hacknetos.autoinstall on the kernel command line)
+ConditionKernelCommandLine=hacknetos.autoinstall
+After=local-fs.target
+Before=greetd.service display-manager.service getty@tty1.service
+# NOTE: no Conflicts=greetd.service here. systemd applies Conflicts while
+# building the boot transaction, before evaluating ConditionKernelCommandLine,
+# which silently removed greetd from every normal boot. The installer script
+# stops greetd itself when an unattended install actually runs.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hacknetos-autoinstall
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target

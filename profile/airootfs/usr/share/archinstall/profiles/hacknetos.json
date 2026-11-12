@@ -1,0 +1,36 @@
+{
+  "version": "1.0",
+  "name": "HacknetOS",
+  "description": "HacknetOS - Fixed-grid Wayland desktop with Hyprland",
+  "packages": [
+    "hacknet-os"
+  ],
+  "bootloader": {
+    "type": "grub",
+    "efi": true
+  },
+  "filesystem": "ext4",
+  "timezone": "UTC",
+  "locale": "en_US.UTF-8",
+  "keyboard": "us",
+  "hostname": "hacknetos",
+  "root_password": "",
+  "user": {
+    "username": "user",
+    "password": "",
+    "groups": ["wheel", "video", "audio", "input", "network", "storage", "power", "lp", "scanner"],
+    "sudo": true
+  },
+  "services": [
+    "NetworkManager",
+    "systemd-resolved",
+    "bluetooth",
+    "fstrim.timer",
+    "reflector.timer",
+    "hacknetd"
+  ],
+  "bootloader_extra_args": "quiet loglevel=3 nowatchdog",
+  "kernel_params": "quiet loglevel=3 nowatchdog",
+  "efi": true,
+  "swap": false
+}

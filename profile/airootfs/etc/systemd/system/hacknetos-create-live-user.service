@@ -1,0 +1,13 @@
+[Unit]
+Description=Create HacknetOS Live User
+Before=hacknetos-setup.service
+ConditionPathExists=!/etc/hacknetos-user-created
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hacknetos-create-live-user
+ExecStartPost=/bin/touch /etc/hacknetos-user-created
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

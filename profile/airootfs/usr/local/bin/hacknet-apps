@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+import glob, os, re, json, sys
+
+def get_apps():
+    apps = []
+    seen = set()
+    dirs = [
+        os.path.expanduser("~/.local/share/applications"),
+        "/usr/local/share/applications",
+        "/usr/share/applications"
+    ]
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for p in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+            fname = os.path.basename(p)
+            if fname in seen:
+                continue
+            seen.add(fname)
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                if "NoDisplay=true" in content:
+                    continue
+                name_m = re.search(r"^Name=(.+)$", content, re.MULTILINE)
+                exec_m = re.search(r"^Exec=(.+)$", content, re.MULTILINE)
+                comment_m = re.search(r"^Comment=(.+)$", content, re.MULTILINE)
+                icon_m = re.search(r"^Icon=(.+)$", content, re.MULTILINE)
+                terminal_m = re.search(r"^Terminal=true", content, re.MULTILINE)
+                categories_m = re.search(r"^Categories=(.+)$", content, re.MULTILINE)
+                keywords_m = re.search(r"^Keywords=(.+)$", content, re.MULTILINE)
+
+                if name_m and exec_m:
+                    name = name_m.group(1).strip()
+                    # Strip %f, %F, %u, %U field codes
+                    raw_cmd = re.sub(r"%[a-zA-Z]", "", exec_m.group(1)).strip()
+                    is_term = bool(terminal_m)
+                    if is_term and not raw_cmd.startswith("foot"):
+                        exec_cmd = f"foot {raw_cmd}"
+                    else:
+                        exec_cmd = raw_cmd
+                    
+                    apps.append({
+                        "id": fname[:-8],
+                        "name": name,
+                        "comment": comment_m.group(1).strip() if comment_m else "",
+                        "exec": exec_cmd,
+                        "icon": icon_m.group(1).strip() if icon_m else "application-x-executable",
+                        "is_terminal": is_term,
+                        "categories": categories_m.group(1).strip() if categories_m else "",
+                        "keywords": keywords_m.group(1).strip() if keywords_m else ""
+                    })
+            except Exception:
+                pass
+    return apps
+
+if __name__ == "__main__":
+    print(json.dumps(get_apps()))

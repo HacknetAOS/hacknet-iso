@@ -1,0 +1,56 @@
+#!/bin/bash
+# Unattended install, used for automated testing and provisioning.
+# Only started when the kernel command line contains "hacknetos.autoinstall".
+#
+#   hacknetos.autoinstall=1 [hacknetos.disk=/dev/sda]
+#   [hacknetos.user=alice] [hacknetos.password=secret] [hacknetos.hostname=x]
+#
+# Progress and the final status are written to /dev/console so a serial log
+# captures them even if the graphical session fails.
+set -u
+
+console() { printf '\nAUTOINSTALL: %s\n' "$*" > /dev/console 2>/dev/null || true; }
+
+arg() {
+    # arg <name-without-hacknetos.> <default>
+    local key="hacknetos.$1" default="$2" tok
+    for tok in $(cat /proc/cmdline); do
+        case "$tok" in
+            "$key"=*) printf '%s' "${tok#*=}"; return 0 ;;
+        esac
+    done
+    printf '%s' "$default"
+}
+
+export HACKNET_YES=1
+export HACKNET_NO_REBOOT=1   # the harness reboots the disk itself
+DISK_ARG="$(arg disk auto)"
+if [[ "$DISK_ARG" == "auto" || ( "$DISK_ARG" == "/dev/sda" && ! -b "/dev/sda" ) ]]; then
+    export HACKNET_DISK=""
+else
+    export HACKNET_DISK="$DISK_ARG"
+fi
+export HACKNET_PARTITION="$(arg partition "")"
+export HACKNET_MODE="$(arg mode "")"
+export HACKNET_USER="$(arg user alice)"
+export HACKNET_PASSWORD="$(arg password hacknet)"
+export HACKNET_HOSTNAME="$(arg hostname hacknetos)"
+
+# Free memory: the installer copies the root filesystem and rebuilds an
+# initramfs, which does not need the desktop running.
+systemctl stop greetd.service 2>/dev/null || true
+
+console "starting (disk=${HACKNET_DISK}, user=${HACKNET_USER})"
+/usr/local/bin/hacknetos-installer
+rc=$?
+console "finished rc=${rc}"
+
+sync
+# Give the serial log a moment to drain before powering off.
+sleep 3
+if [ "$rc" -eq 0 ]; then
+    poweroff -f
+else
+    console "FAILED - dropping to a shell"
+    exec /bin/bash
+fi

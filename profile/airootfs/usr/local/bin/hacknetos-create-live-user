@@ -1,0 +1,18 @@
+#!/bin/bash
+# Create live user for HacknetOS live ISO
+
+set -euo pipefail
+
+# Create live user if it doesn't exist
+if ! id "live" &>/dev/null; then
+    useradd -m -s /bin/bash -G wheel,video,audio,input,network,storage,power,lp,scanner live
+    # Set empty password for passwordless login
+    passwd -d live
+    echo "Created live user"
+else
+    # Ensure groups are correct
+    usermod -aG wheel,video,audio,input,network,storage,power,lp,scanner live 2>/dev/null || true
+    # Ensure empty password
+    passwd -d live
+    echo "Live user already exists, updated groups and password"
+fi

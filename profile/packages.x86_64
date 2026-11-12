@@ -1,0 +1,149 @@
+# HacknetOS archiso profile - packages.x86_64
+#
+# The live ISO doubles as the installation source: hacknetos-installer copies
+# this root filesystem onto the target disk, so every package the installed
+# system needs must be present here.
+#
+# The HacknetOS packages themselves (hacknet-os, hacknetd, hacknetctl,
+# hacknet-proto, hacknet-shell, hacknet-theme) are NOT listed here: they live in
+# the local repository, whose only copy is the airootfs package cache. They are
+# installed by customize_airootfs.sh once their dependencies below exist.
+
+# Base system
+base
+linux
+linux-firmware
+mkinitcpio
+systemd-sysvcompat
+archiso
+mkinitcpio-archiso
+iptables
+pipewire-jack
+
+# Boot loaders
+grub
+os-prober
+efibootmgr
+syslinux
+
+# Networking
+iwd
+dhcpcd
+wpa_supplicant
+networkmanager
+bluez
+bluez-utils
+
+# Filesystem tools
+btrfs-progs
+dosfstools
+e2fsprogs
+xfsprogs
+ntfs-3g
+exfatprogs
+# Needed by hacknetos-installer to partition the target disk
+parted
+arch-install-scripts
+
+# HacknetOS desktop runtime: the dependency set of the hacknet-os meta-package.
+hyprland
+quickshell
+foot
+pipewire
+wireplumber
+pipewire-pulse
+cava
+sway
+grim
+slurp
+wl-clipboard
+polkit
+xdg-desktop-portal-hyprland
+xdg-desktop-portal-gtk
+noto-fonts
+noto-fonts-emoji
+ttf-jetbrains-mono-nerd
+bash-completion
+jq
+playerctl
+libcanberra
+upower
+# Optional integrations used by hacknet-theme.
+gtk3
+gtk4
+qt6ct
+starship
+
+# Login screen (used on the installed system)
+greetd
+greetd-tuigreet
+fprintd
+
+# Tools people expect on a Linux system
+wget
+curl
+ffmpeg
+git
+vim
+nano
+yay
+base-devel
+htop
+btop
+fastfetch
+man-db
+man-pages
+texinfo
+which
+less
+reflector
+pacman-contrib
+pkgfile
+unzip
+zip
+tar
+gzip
+xz
+bzip2
+p7zip
+rsync
+openssh
+sudo
+tree
+fd
+ripgrep
+bat
+fzf
+eza
+lsof
+strace
+psmisc
+procps-ng
+iproute2
+iputils
+traceroute
+bind
+whois
+file
+screen
+tmux
+
+# Firmware microcode
+intel-ucode
+amd-ucode
+
+# Desktop apps, media and drivers requested for daily use
+pipewire-alsa
+thunar
+thunar-volman
+gvfs
+gvfs-mtp
+gvfs-smb
+ffmpegthumbnailer
+tumbler
+vulkan-radeon
+vulkan-intel
+vulkan-nouveau
+xdg-desktop-portal-wlr
+mpv
+swaybg

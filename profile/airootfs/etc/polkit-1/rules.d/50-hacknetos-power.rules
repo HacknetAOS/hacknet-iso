@@ -1,0 +1,14 @@
+// HacknetOS: the session menu must be able to reboot/suspend/power off without
+// a polkit prompt. Any *local* user in wheel is the machine's operator (they
+// already hold sudo); remote sessions still need authentication.
+polkit.addRule(function (action, subject) {
+    if ((action.id === "org.freedesktop.login1.reboot" ||
+         action.id === "org.freedesktop.login1.reboot-multiple-sessions" ||
+         action.id === "org.freedesktop.login1.power-off" ||
+         action.id === "org.freedesktop.login1.power-off-multiple-sessions" ||
+         action.id === "org.freedesktop.login1.suspend" ||
+         action.id === "org.freedesktop.login1.suspend-multiple-sessions") &&
+        subject.local && subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});

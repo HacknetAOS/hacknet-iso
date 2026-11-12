@@ -1,0 +1,13 @@
+[Unit]
+Description=HacknetOS Live Environment Setup
+ConditionPathExists=!/etc/hacknetos-setup-done
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hacknetos-setup-live
+ExecStartPost=/bin/touch /etc/hacknetos-setup-done
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

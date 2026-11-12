@@ -1,0 +1,730 @@
+#!/bin/bash
+# hacknetos-installer - Modern Offline & Multi-Boot Installer for HacknetOS
+#
+# Supports:
+#   1. Multi-Boot / Dual-Boot: Install HacknetOS alongside existing Linux/Windows
+#      installations on the same drive without wiping other partitions. Reuses
+#      existing ESP (UEFI) or updates GRUB with os-prober (BIOS).
+#   2. Clean Install: Complete disk erase with automatic partitioning.
+#   3. Unattended Mode: Fully automated installation for CI/CD and VM testing.
+#
+# Interactive:
+#   sudo hacknetos-installer
+#
+# Unattended Clean Install:
+#   sudo HACKNET_YES=1 HACKNET_DISK=/dev/sda \
+#        HACKNET_USER=alice HACKNET_PASSWORD=secret \
+#        HACKNET_HOSTNAME=hacknetos hacknetos-installer
+#
+# Unattended Multi-Boot Install:
+#   sudo HACKNET_YES=1 HACKNET_DISK=/dev/sda HACKNET_PARTITION=/dev/sda3 \
+#        HACKNET_USER=alice HACKNET_PASSWORD=secret \
+#        HACKNET_HOSTNAME=hacknetos hacknetos-installer
+
+set -euo pipefail
+
+# ---------------------------------------------------------------- visual styling
+CYAN='\033[1;36m'
+GREEN='\033[1;32m'
+RED='\033[1;31m'
+YELLOW='\033[1;33m'
+WHITE='\033[1;37m'
+DIM='\033[38;5;242m'
+RESET='\033[0m'
+
+show_banner() {
+    printf '%b' "${CYAN}"
+    cat <<'BANNER'
+================================================================================
+  ██╗  ██╗ █████╗  ██████╗██╗  ██╗███╗   ██╗███████╗████████╗ ██████╗ ███████╗
+  ██║  ██║██╔══██╗██╔════╝██║ ██╔╝████╗  ██║██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
+  ███████║███████║██║     █████╔╝ ██╔██╗ ██║█████╗     ██║   ██║   ██║███████╗
+  ██╔══██║██╔══██║██║     ██╔═██╗ ██║╚██╗██║██╔══╝     ██║   ██║   ██║╚════██║
+  ██║  ██║██║  ██║╚██████╗██║  ██╗██║ ╚████║███████╗   ██║   ╚██████╔╝███████║
+  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝ ╚══════╝
+                     [ SYSTEM INSTALLATION PROTOCOL ]
+================================================================================
+BANNER
+    printf '%b' "${RESET}"
+}
+
+step() {
+    printf '\n%b===[ STEP %s ] %s%b\n' "${CYAN}" "$1" "$2" "${RESET}"
+}
+
+log() {
+    printf '%b[+]%b %s\n' "${CYAN}" "${RESET}" "$*"
+}
+
+success() {
+    printf '%b[✓]%b %s\n' "${GREEN}" "${RESET}" "$*"
+}
+
+warn() {
+    printf '%b[!] WARN:%b %s\n' "${YELLOW}" "${RESET}" "$*" >&2
+}
+
+die() {
+    printf '%b[✗] ERROR:%b %s\n' "${RED}" "${RESET}" "$*" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------- preflight checks
+[[ ${EUID} -eq 0 ]] || die "must be run as root (sudo hacknetos-installer)"
+
+command -v parted    >/dev/null || die "parted is missing"
+command -v mkfs.ext4 >/dev/null || die "e2fsprogs is missing"
+command -v tar       >/dev/null || die "tar is missing"
+command -v lsblk     >/dev/null || die "util-linux (lsblk) is missing"
+command -v blkid     >/dev/null || die "util-linux (blkid) is missing"
+
+MNT=/mnt
+DISK="${HACKNET_DISK:-}"
+TARGET_PART="${HACKNET_PARTITION:-}"
+INSTALL_MODE="${HACKNET_MODE:-}"
+NEWUSER="${HACKNET_USER:-}"
+NEWPASS="${HACKNET_PASSWORD:-}"
+NEWHOST="${HACKNET_HOSTNAME:-hacknetos}"
+ASSUME_YES="${HACKNET_YES:-0}"
+
+if [[ -d /sys/firmware/efi ]]; then
+    FIRMWARE="uefi"
+else
+    FIRMWARE="bios"
+fi
+
+part_name() { # part_name <disk> <num>
+    if [[ "$1" =~ [0-9]$ ]]; then echo "${1}p$2"; else echo "${1}$2"; fi
+}
+
+get_part_num() { # get_part_num <part_device>
+    local num
+    num=$(echo "$1" | grep -o '[0-9]*$')
+    echo "${num:-1}"
+}
+
+# ---------------------------------------------------------------- OS detection
+detect_os() {
+    local dev="$1"
+    local fstype
+    fstype=$(lsblk -no FSTYPE "$dev" 2>/dev/null || true)
+    [[ -z "$fstype" ]] && fstype=$(blkid -s TYPE -o value "$dev" 2>/dev/null || true)
+
+    if [[ "$fstype" == "swap" ]]; then
+        echo "Linux Swap"
+        return
+    fi
+
+    local parttype
+    parttype=$(lsblk -no PARTTYPE "$dev" 2>/dev/null || true)
+    [[ -z "$parttype" ]] && parttype=$(blkid -s PARTTYPE -o value "$dev" 2>/dev/null || true)
+    local plabel
+    plabel=$(lsblk -no PARTLABEL "$dev" 2>/dev/null || true)
+    [[ -z "$plabel" ]] && plabel=$(blkid -s PARTLABEL -o value "$dev" 2>/dev/null || true)
+    if [[ "$parttype" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]] || \
+       [[ "$fstype" == "vfat" && ( "$plabel" =~ [Ee][Ff][Ii] || "$parttype" == "0xef" ) ]]; then
+        echo "EFI System Partition"
+        return
+    fi
+
+    case "$fstype" in
+        ext2|ext3|ext4|btrfs|xfs|f2fs|vfat|ntfs) ;;
+        *) echo ""; return ;;
+    esac
+
+    local os_name=""
+    local mounted_here=0
+    local target
+    target=$(findmnt -no TARGET "$dev" 2>/dev/null || true)
+
+    if [[ -z "$target" ]]; then
+        local tmp_mnt
+        tmp_mnt=$(mktemp -d /tmp/hacknet-probe.XXXXXX 2>/dev/null || true)
+        if [[ -n "$tmp_mnt" ]] && mount -o ro "$dev" "$tmp_mnt" 2>/dev/null; then
+            target="$tmp_mnt"
+            mounted_here=1
+        fi
+    fi
+
+    if [[ -n "$target" ]]; then
+        if [[ -f "$target/etc/os-release" ]]; then
+            os_name=$(grep -E '^PRETTY_NAME=' "$target/etc/os-release" 2>/dev/null | cut -d= -f2- | tr -d '"')
+            if [[ -z "$os_name" ]]; then
+                os_name=$(grep -E '^NAME=' "$target/etc/os-release" 2>/dev/null | cut -d= -f2- | tr -d '"')
+            fi
+        elif [[ -f "$target/usr/lib/os-release" ]]; then
+            os_name=$(grep -E '^PRETTY_NAME=' "$target/usr/lib/os-release" 2>/dev/null | cut -d= -f2- | tr -d '"')
+        elif [[ -d "$target/Windows/System32" ]]; then
+            os_name="Microsoft Windows"
+        elif [[ -d "$target/EFI" ]]; then
+            os_name="EFI System"
+        fi
+
+        if [[ $mounted_here -eq 1 ]]; then
+            umount "$target" 2>/dev/null || true
+            rmdir "$target" 2>/dev/null || true
+        fi
+    fi
+
+    if [[ -z "$os_name" ]] && command -v os-prober >/dev/null 2>&1; then
+        local probe_out
+        probe_out=$(os-prober 2>/dev/null | grep "^${dev}:" || true)
+        if [[ -n "$probe_out" ]]; then
+            os_name=$(echo "$probe_out" | cut -d: -f2)
+        fi
+    fi
+
+    echo "$os_name"
+}
+
+# ---------------------------------------------------------------- disk selection
+show_banner
+
+step "1/5" "Select Storage Drive"
+
+# Find physical disks (exclude virtual loops, roms, zram, live mount)
+DISKS=()
+while read -r d; do
+    [[ -n "$d" ]] || continue
+    case "$d" in
+        /dev/sr*|/dev/loop*|/dev/zram*|/dev/dm-*|/dev/fd*) continue ;;
+    esac
+    # Exclude running live media
+    if grep -q " /run/archiso/bootmnt " /proc/mounts 2>/dev/null; then
+        LIVE_SRC=$(findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null || true)
+        LIVE_PARENT=$(lsblk -no pkname "${LIVE_SRC}" 2>/dev/null | head -1 || true)
+        if [[ -n "${LIVE_PARENT}" && "/dev/${LIVE_PARENT}" == "$d" ]]; then
+            continue
+        fi
+    fi
+    DISKS+=("$d")
+done < <(lsblk -dpno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+
+if [[ ${#DISKS[@]} -eq 0 ]]; then
+    # Fallback if no disk classified by lsblk
+    while read -r d; do
+        [[ -b "$d" ]] && DISKS+=("$d")
+    done < <(lsblk -dpno NAME 2>/dev/null | grep -E '^/dev/(sd[a-z]|vd[a-z]|nvme[0-9]n[0-9]|xvd[a-z])' || true)
+fi
+
+[[ ${#DISKS[@]} -gt 0 ]] || die "No suitable hard drive found"
+
+if [[ -n "${DISK}" && ! -b "${DISK}" ]]; then
+    warn "Specified disk '${DISK}' is not a valid block device. Falling back to auto-detection."
+    DISK=""
+fi
+
+if [[ -z "${DISK}" ]]; then
+    if [[ "${ASSUME_YES}" -eq 1 ]]; then
+        DISK="${DISKS[0]}"
+        log "Auto-selected target drive: ${WHITE}${DISK}${RESET}"
+    else
+        echo
+        log "Detected Storage Drives:"
+        printf "  %-4s %-12s %-10s %-20s\n" "NUM" "DEVICE" "SIZE" "MODEL"
+        printf "  %-4s %-12s %-10s %-20s\n" "---" "------" "----" "-----"
+        idx=1
+        for d in "${DISKS[@]}"; do
+            size=$(lsblk -dn -o SIZE "$d" 2>/dev/null || echo "Unknown")
+            model=$(lsblk -dn -o MODEL "$d" 2>/dev/null || echo "Generic")
+            printf "  [%d]  %-12s %-10s %-20s\n" "$idx" "$d" "$size" "$model"
+            ((idx++))
+        done
+        echo
+        while true; do
+            read -rp "Select target drive [1-${#DISKS[@]}] (default 1): " choice
+            choice="${choice:-1}"
+            if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#DISKS[@]} ]]; then
+                DISK="${DISKS[$((choice-1))]}"
+                break
+            elif [[ -b "$choice" ]]; then
+                DISK="$choice"
+                break
+            fi
+            echo "Invalid selection. Please choose a number between 1 and ${#DISKS[@]}."
+        done
+    fi
+fi
+
+[[ -b "${DISK}" ]] || die "'${DISK}' is not a valid block device"
+REAL=$(readlink -f "${DISK}")
+log "Selected drive: ${WHITE}${REAL}${RESET} (${FIRMWARE^^} mode)"
+
+# ---------------------------------------------------------------- inspect partitions
+step "2/5" "Select Installation Mode"
+
+PARTS=()
+while read -r p; do
+    [[ -b "$p" ]] && PARTS+=("$p")
+done < <(lsblk -lpno NAME,TYPE "${REAL}" 2>/dev/null | awk '$2=="part"{print $1}')
+
+echo
+log "Partition table on ${REAL}:"
+if [[ ${#PARTS[@]} -gt 0 ]]; then
+    printf "  %-14s %-8s %-10s %-24s\n" "PARTITION" "SIZE" "FSTYPE" "OS / LABEL"
+    printf "  %-14s %-8s %-10s %-24s\n" "---------" "----" "------" "----------"
+    for p in "${PARTS[@]}"; do
+        psize=$(lsblk -dno SIZE "$p" 2>/dev/null || echo "")
+        pfstype=$(lsblk -dno FSTYPE "$p" 2>/dev/null || echo "")
+        pos=$(detect_os "$p")
+        if [[ -z "$pos" ]]; then
+            pos=$(lsblk -dno LABEL "$p" 2>/dev/null || echo "")
+        fi
+        [[ -n "$pos" ]] && pos="[${pos}]"
+        printf "  %-14s %-8s %-10s %-24s\n" "$p" "$psize" "$pfstype" "$pos"
+    done
+else
+    echo "  (Drive is unpartitioned / empty)"
+fi
+echo
+
+# Find candidate partitions for multi-boot (ext4, unformatted, non-ESP, >= 4GB)
+CANDIDATE_PARTS=()
+DETECTED_ESP=""
+
+for p in "${PARTS[@]}"; do
+    ptype=$(lsblk -dno PARTTYPE "$p" 2>/dev/null || true)
+    [[ -z "$ptype" ]] && ptype=$(blkid -s PARTTYPE -o value "$p" 2>/dev/null || true)
+    pfstype=$(lsblk -dno FSTYPE "$p" 2>/dev/null || true)
+    [[ -z "$pfstype" ]] && pfstype=$(blkid -s TYPE -o value "$p" 2>/dev/null || true)
+    plabel=$(lsblk -dno PARTLABEL "$p" 2>/dev/null || true)
+    [[ -z "$plabel" ]] && plabel=$(blkid -s PARTLABEL -o value "$p" 2>/dev/null || true)
+
+    # Check for EFI System Partition
+    if [[ "$ptype" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" || "$ptype" == "0xef" ]] || \
+       [[ "$pfstype" == "vfat" && ( "$plabel" =~ [Ee][Ff][Ii] || "$(detect_os "$p")" =~ EFI ) ]]; then
+        if [[ -z "$DETECTED_ESP" ]]; then
+            DETECTED_ESP="$p"
+        fi
+        continue
+    fi
+
+    # Ignore swap
+    if [[ "$pfstype" == "swap" ]]; then
+        continue
+    fi
+
+    # Candidate for root
+    CANDIDATE_PARTS+=("$p")
+done
+
+# If HACKNET_PARTITION was provided, auto-select multi-boot
+if [[ -n "${TARGET_PART}" ]]; then
+    INSTALL_MODE="multiboot"
+fi
+
+if [[ -z "${INSTALL_MODE}" ]]; then
+    if [[ ${#PARTS[@]} -gt 0 && ${#CANDIDATE_PARTS[@]} -gt 0 ]]; then
+        echo "Choose installation strategy:"
+        echo "  [1] Multi-Boot / Install alongside existing Linux/OS (Recommended)"
+        echo "      Installs HacknetOS to a designated partition."
+        echo "      Existing partitions and operating systems remain intact."
+        echo
+        echo "  [2] Clean Install (Erase entire disk)"
+        echo "      Wipes all data and partitions on ${REAL}."
+        echo
+        read -rp "Select mode [1-2] (default 1): " mode_choice
+        mode_choice="${mode_choice:-1}"
+        if [[ "$mode_choice" == "2" ]]; then
+            INSTALL_MODE="clean"
+        else
+            INSTALL_MODE="multiboot"
+        fi
+    else
+        INSTALL_MODE="clean"
+    fi
+fi
+
+ESP=""
+ROOT=""
+
+if [[ "${INSTALL_MODE}" == "multiboot" ]]; then
+    log "Mode: ${GREEN}Multi-Boot / Dual-Boot Installation${RESET}"
+
+    if [[ -z "${TARGET_PART}" ]]; then
+        echo
+        log "Select partition for HacknetOS Root (/):"
+        cidx=1
+        for cp in "${CANDIDATE_PARTS[@]}"; do
+            cpsize=$(lsblk -dno SIZE "$cp" 2>/dev/null || echo "")
+            cpfs=$(lsblk -dno FSTYPE "$cp" 2>/dev/null || echo "none")
+            cpos=$(detect_os "$cp")
+            [[ -n "$cpos" ]] && cpos=" - ${cpos}"
+            printf "  [%d] %-14s (%s, %s%s)\n" "$cidx" "$cp" "$cpsize" "$cpfs" "$cpos"
+            ((cidx++))
+        done
+        echo
+        while true; do
+            read -rp "Select root partition [1-${#CANDIDATE_PARTS[@]}]: " p_choice
+            if [[ "$p_choice" =~ ^[0-9]+$ ]] && [[ "$p_choice" -ge 1 ]] && [[ "$p_choice" -le ${#CANDIDATE_PARTS[@]} ]]; then
+                TARGET_PART="${CANDIDATE_PARTS[$((p_choice-1))]}"
+                break
+            elif [[ -b "$p_choice" ]]; then
+                TARGET_PART="$p_choice"
+                break
+            fi
+            echo "Invalid selection."
+        done
+    fi
+
+    [[ -b "${TARGET_PART}" ]] || die "Target partition '${TARGET_PART}' does not exist"
+    ROOT="${TARGET_PART}"
+
+    if [[ "${FIRMWARE}" == "uefi" ]]; then
+        if [[ -n "${DETECTED_ESP}" ]]; then
+            ESP="${DETECTED_ESP}"
+            log "Reusing existing EFI System Partition: ${WHITE}${ESP}${RESET} (preserving entries)"
+        else
+            warn "No EFI System Partition automatically detected on ${REAL}."
+            read -rp "Enter EFI System Partition (e.g. ${REAL}1): " ESP
+            [[ -b "${ESP}" ]] || die "ESP partition '${ESP}' does not exist"
+        fi
+    fi
+else
+    log "Mode: ${RED}Clean Install (Entire Disk Wipe)${RESET}"
+    if [[ "${FIRMWARE}" == "uefi" ]]; then
+        ESP=$(part_name "${REAL}" 1)
+        ROOT=$(part_name "${REAL}" 2)
+    else
+        ROOT=$(part_name "${REAL}" 1)
+        ESP=""
+    fi
+fi
+
+# ---------------------------------------------------------------- credentials
+step "3/5" "Identity & System Credentials"
+
+if [[ -z "${NEWUSER}" ]]; then
+    read -rp "Username (default: hacknet): " NEWUSER
+    NEWUSER="${NEWUSER:-hacknet}"
+fi
+[[ "${NEWUSER}" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid username '${NEWUSER}'"
+
+if [[ -z "${NEWPASS}" ]]; then
+    while true; do
+        read -rsp "Password for ${NEWUSER}: " NEWPASS; echo
+        [[ -n "${NEWPASS}" ]] || { echo "Password cannot be empty"; continue; }
+        read -rsp "Repeat password: " NEWPASS2; echo
+        if [[ "${NEWPASS}" == "${NEWPASS2}" ]]; then
+            break
+        fi
+        echo "Passwords do not match. Try again."
+    done
+fi
+[[ -n "${NEWPASS}" ]] || die "password must not be empty"
+
+if [[ -z "${NEWHOST}" ]]; then
+    read -rp "Hostname (default: hacknetos): " NEWHOST
+    NEWHOST="${NEWHOST:-hacknetos}"
+fi
+
+# ---------------------------------------------------------------- summary & confirmation
+step "4/5" "Review Installation Summary"
+
+echo "================================================================================"
+printf "  Target Disk       : %b%s%b\n" "${WHITE}" "${REAL}" "${RESET}"
+printf "  Firmware Mode     : %b%s%b\n" "${WHITE}" "${FIRMWARE^^}" "${RESET}"
+if [[ "${INSTALL_MODE}" == "multiboot" ]]; then
+    printf "  Installation Mode : %bMulti-Boot (Preserving other partitions)%b\n" "${GREEN}" "${RESET}"
+    printf "  Root Partition    : %b%s%b (WILL BE FORMATTED as ext4)\n" "${YELLOW}" "${ROOT}" "${RESET}"
+    if [[ "${FIRMWARE}" == "uefi" ]]; then
+        printf "  EFI Partition     : %b%s%b (Reused & preserved)\n" "${CYAN}" "${ESP}" "${RESET}"
+    fi
+else
+    printf "  Installation Mode : %bClean Install (Wipes entire drive)%b\n" "${RED}" "${RESET}"
+    printf "  Target Partitions : Root: %s" "${ROOT}"
+    [[ -n "${ESP}" ]] && printf ", ESP: %s" "${ESP}"
+    printf "\n"
+fi
+printf "  User Account      : %s\n" "${NEWUSER}"
+printf "  Hostname          : %s\n" "${NEWHOST}"
+echo "================================================================================"
+
+if [[ "${ASSUME_YES}" != "1" ]]; then
+    if [[ "${INSTALL_MODE}" == "clean" ]]; then
+        warn "ALL EXISTING DATA ON ${REAL} WILL BE PERMANENTLY DESTROYED."
+        read -rp "Type ERASE to proceed: " ans
+        [[ "${ans}" == "ERASE" ]] || die "Installation aborted by user"
+    else
+        read -rp "Proceed with installation? [y/N]: " ans
+        [[ "${ans}" =~ ^[Yy]([Ee][Ss])?$ ]] || die "Installation aborted by user"
+    fi
+fi
+
+# ---------------------------------------------------------------- execution
+step "5/5" "Installing HacknetOS"
+
+log "Preparing storage devices..."
+swapoff -a 2>/dev/null || true
+umount -R "${MNT}" 2>/dev/null || true
+umount "${ROOT}" 2>/dev/null || true
+[[ -n "${ESP}" ]] && umount "${ESP}" 2>/dev/null || true
+
+if [[ "${INSTALL_MODE}" == "clean" ]]; then
+    log "Partitioning disk ${REAL}..."
+    if [[ "${FIRMWARE}" == "uefi" ]]; then
+        parted -s "${REAL}" -- mklabel gpt
+        parted -s "${REAL}" -- mkpart ESP fat32 1MiB 513MiB
+        parted -s "${REAL}" -- set 1 esp on
+        parted -s "${REAL}" -- mkpart root ext4 513MiB 100%
+    else
+        parted -s "${REAL}" -- mklabel msdos
+        parted -s "${REAL}" -- mkpart primary ext4 1MiB 100%
+        parted -s "${REAL}" -- set 1 boot on
+    fi
+    partprobe "${REAL}" 2>/dev/null || true
+    udevadm settle 2>/dev/null || sleep 2
+
+    log "Formatting filesystems..."
+    if [[ "${FIRMWARE}" == "uefi" ]]; then
+        mkfs.vfat -F32 -n HACKNET_ESP "${ESP}"
+    fi
+    mkfs.ext4 -F -L HACKNETOS "${ROOT}"
+else
+    log "Formatting designated HacknetOS root partition ${ROOT} (ext4)..."
+    mkfs.ext4 -F -L HACKNETOS "${ROOT}"
+    if [[ "${FIRMWARE}" == "uefi" && -n "${ESP}" ]]; then
+        log "Preserving existing EFI partition ${ESP} (skipping format)"
+    fi
+fi
+
+log "Mounting target filesystems..."
+mkdir -p "${MNT}"
+mount "${ROOT}" "${MNT}"
+if [[ "${FIRMWARE}" == "uefi" && -n "${ESP}" ]]; then
+    mkdir -p "${MNT}/boot"
+    mount "${ESP}" "${MNT}/boot"
+fi
+
+# ---------------------------------------------------------------- copy system
+log "Copying system image (this may take a few moments)..."
+tar -C / -cf - \
+    --exclude=./proc --exclude=./sys --exclude=./dev --exclude=./run \
+    --exclude=./tmp --exclude=./mnt --exclude=./media --exclude=./lost+found \
+    --exclude=./boot/initramfs-linux.img \
+    --exclude=./boot/initramfs-linux-fallback.img \
+    . | tar -C "${MNT}" -xpf -
+
+# Recreate runtime directories required by chroot and systemd
+mkdir -p "${MNT}/proc" "${MNT}/sys" "${MNT}/dev" "${MNT}/run" "${MNT}/tmp" \
+         "${MNT}/mnt" "${MNT}/media" "${MNT}/var/tmp" "${MNT}/root"
+chmod 1777 "${MNT}/tmp" "${MNT}/var/tmp"
+chmod 700  "${MNT}/root"
+
+# Generate fstab for mounted partitions
+rm -f "${MNT}/etc/fstab"
+genfstab -U "${MNT}" >> "${MNT}/etc/fstab"
+
+# Host configuration
+printf '%s\n' "${NEWHOST}" > "${MNT}/etc/hostname"
+cat > "${MNT}/etc/hosts" <<EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${NEWHOST}.localdomain ${NEWHOST}
+EOF
+
+# Installed /etc/issue banner
+cat > "${MNT}/etc/issue" <<EOF
+
+  ${NEWHOST} - HacknetOS
+
+  Login with user '${NEWUSER}' to launch the HacknetOS environment.
+
+EOF
+
+# Configure GRUB defaults (enabling os-prober for multi-boot support)
+mkdir -p "${MNT}/etc/default"
+cat > "${MNT}/etc/default/grub" <<EOF
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR="HacknetOS"
+GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet console=tty0 console=ttyS0"
+GRUB_CMDLINE_LINUX=""
+GRUB_DISABLE_OS_PROBER=false
+EOF
+
+# Initramfs configuration (clean non-archiso hooks)
+cat > "${MNT}/etc/mkinitcpio.conf" <<'EOF'
+# vim:set ft=sh:
+MODULES=()
+BINARIES=()
+FILES=()
+HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)
+COMPRESSION="zstd"
+EOF
+rm -f "${MNT}/boot/initramfs-linux.img" "${MNT}/boot/initramfs-linux-fallback.img"
+rm -f "${MNT}/etc/mkinitcpio.conf.d/archiso.conf"
+mkdir -p "${MNT}/etc/mkinitcpio.conf.d"
+cat > "${MNT}/etc/mkinitcpio.conf.d/zz-hacknet-installed.conf" <<'MKEOF'
+HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)
+MKEOF
+
+# Clean up live-only configs and services
+mkdir -p "${MNT}/etc/systemd/system/getty@tty1.service.d"
+rm -f "${MNT}/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+rm -f "${MNT}/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf"
+rm -f "${MNT}/etc/sudoers.d/10-live"
+rm -f "${MNT}/home/live/.bash_profile"
+
+mkdir -p "${MNT}/etc/greetd"
+cat > "${MNT}/etc/greetd/config.toml" <<'GREET'
+[terminal]
+vt = 1
+
+[general]
+source_profile = false
+
+[default_session]
+command = "/usr/bin/hacknet-greeter"
+user = "greeter"
+GREET
+
+# Kernel image copy
+KERNEL_SRC=""
+if [[ -f "/run/archiso/bootmnt/arch/boot/$(uname -m)/vmlinuz-linux" ]]; then
+    KERNEL_SRC="/run/archiso/bootmnt/arch/boot/$(uname -m)/vmlinuz-linux"
+elif [[ -f "/boot/vmlinuz-linux" ]]; then
+    KERNEL_SRC="/boot/vmlinuz-linux"
+fi
+
+if [[ -n "${KERNEL_SRC}" && -f "${KERNEL_SRC}" ]]; then
+    log "Installing kernel (${KERNEL_SRC##*/})"
+    mkdir -p "${MNT}/boot"
+    install -m 644 "${KERNEL_SRC}" "${MNT}/boot/vmlinuz-linux"
+elif [[ -f "${MNT}/boot/vmlinuz-linux" ]]; then
+    log "Kernel image already in place"
+else
+    die "No kernel image found to install into /boot"
+fi
+
+# Configure users and privileges
+log "Configuring user accounts..."
+arch-chroot "${MNT}" userdel -r live >/dev/null 2>&1 || true
+arch-chroot "${MNT}" useradd -m -s /bin/bash \
+    -G wheel,video,audio,input,network,storage,power,optical "${NEWUSER}" 2>/dev/null || true
+printf '%s:%s\n' "${NEWUSER}" "${NEWPASS}" | arch-chroot "${MNT}" chpasswd
+printf 'root:%s\n' "${NEWPASS}" | arch-chroot "${MNT}" chpasswd
+
+if [[ -d "${MNT}/etc/skel/.config" ]]; then
+    mkdir -p "${MNT}/home/${NEWUSER}/.config"
+    cp -rn "${MNT}/etc/skel/.config/"* "${MNT}/home/${NEWUSER}/.config/" 2>/dev/null || true
+    arch-chroot "${MNT}" chown -R "${NEWUSER}:${NEWUSER}" "/home/${NEWUSER}/.config" 2>/dev/null || true
+fi
+
+echo '%wheel ALL=(ALL:ALL) ALL' > "${MNT}/etc/sudoers.d/10-wheel"
+chmod 440 "${MNT}/etc/sudoers.d/10-wheel"
+
+# Regenerate initramfs
+log "Regenerating initramfs..."
+arch-chroot "${MNT}" mkinitcpio -P
+
+# Services configuration
+log "Enabling core system services..."
+arch-chroot "${MNT}" systemctl disable hacknetos-graphical.service >/dev/null 2>&1 || true
+arch-chroot "${MNT}" systemctl disable hacknetos-setup.service >/dev/null 2>&1 || true
+arch-chroot "${MNT}" systemctl disable hacknetos-autoinstall.service >/dev/null 2>&1 || true
+arch-chroot "${MNT}" systemctl disable hacknetos-create-live-user.service >/dev/null 2>&1 || true
+arch-chroot "${MNT}" systemctl disable getty@tty1.service >/dev/null 2>&1 || true
+arch-chroot "${MNT}" systemctl enable NetworkManager.service >/dev/null 2>&1 || true
+arch-chroot "${MNT}" systemctl enable fstrim.timer >/dev/null 2>&1 || true
+arch-chroot "${MNT}" systemctl --global enable hacknetd.service >/dev/null 2>&1 || true
+if ! arch-chroot "${MNT}" id -u greeter >/dev/null 2>&1; then
+    arch-chroot "${MNT}" useradd -r -M -d /var/lib/greetd -s /usr/bin/nologin -G video,input greeter 2>/dev/null || true
+else
+    arch-chroot "${MNT}" usermod -aG video,input greeter 2>/dev/null || true
+    arch-chroot "${MNT}" usermod -s /usr/bin/nologin greeter 2>/dev/null || true
+fi
+mkdir -p "${MNT}/var/lib/greetd"
+arch-chroot "${MNT}" chown -R greeter:greeter /var/lib/greetd 2>/dev/null || true
+arch-chroot "${MNT}" systemctl enable greetd.service >/dev/null 2>&1 || true
+arch-chroot "${MNT}" systemctl enable fprintd.service >/dev/null 2>&1 || true
+
+mkdir -p "${MNT}/etc/profile.d"
+cat > "${MNT}/etc/profile.d/90-hacknet-session.sh" <<'SESSEOF'
+# HacknetOS session auto-starter (only for manual text console logins on tty1 when greetd is not running)
+if [ "$(tty)" = "/dev/tty1" ] \
+   && [ "$USER" != "greeter" ] \
+   && [ "$USER" != "root" ] \
+   && [ -z "${WAYLAND_DISPLAY:-}" ] \
+   && [ -z "${DISPLAY:-}" ] \
+   && ! systemctl is-active --quiet greetd.service 2>/dev/null; then
+    exec > >(tee -a "$HOME/hacknet-session.log") 2>&1
+    echo "=== hacknet session start $(date -Is) ==="
+    exec /usr/bin/hacknet-hyprland
+fi
+SESSEOF
+chmod 644 "${MNT}/etc/profile.d/90-hacknet-session.sh"
+
+arch-chroot "${MNT}" systemctl set-default graphical.target >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------- bootloader configuration
+ROOT_UUID=$(blkid -s UUID -o value "${ROOT}")
+[[ -n "${ROOT_UUID}" ]] || die "Cannot determine UUID for root partition ${ROOT}"
+
+if [[ "${FIRMWARE}" == "uefi" ]]; then
+    log "Configuring systemd-boot (UEFI multi-boot)..."
+    arch-chroot "${MNT}" bootctl --path=/boot install 2>/dev/null \
+        || arch-chroot "${MNT}" bootctl --path=/boot --no-variables install
+
+    mkdir -p "${MNT}/boot/loader/entries"
+    cat > "${MNT}/boot/loader/loader.conf" <<EOF
+default hacknetos.conf
+timeout 5
+console-mode max
+editor no
+EOF
+    cat > "${MNT}/boot/loader/entries/hacknetos.conf" <<EOF
+title   HacknetOS
+linux   /vmlinuz-linux
+initrd  /initramfs-linux.img
+options root=UUID=${ROOT_UUID} rw quiet console=tty0 console=ttyS0
+EOF
+
+    ESP_PARTNUM=$(get_part_num "${ESP}")
+    log "Registering UEFI boot entry on ${REAL} partition ${ESP_PARTNUM}..."
+    arch-chroot "${MNT}" efibootmgr --create --disk "${REAL}" --part "${ESP_PARTNUM}" \
+        --label "HacknetOS" --loader '\EFI\systemd\systemd-bootx64.efi' >/dev/null 2>&1 \
+        || warn "Could not write NVRAM EFI boot entry (firmware setup entry can be selected manually)"
+else
+    log "Configuring GRUB (BIOS multi-boot with os-prober)..."
+    arch-chroot "${MNT}" grub-install --target=i386-pc --recheck "${REAL}"
+    arch-chroot "${MNT}" grub-mkconfig -o /boot/grub/grub.cfg
+fi
+
+# ---------------------------------------------------------------- cleanup & finish
+log "Synchronizing and unmounting disks..."
+sync
+if [[ "${FIRMWARE}" == "uefi" && -n "${ESP}" ]]; then
+    umount "${MNT}/boot" 2>/dev/null || true
+fi
+umount "${MNT}" 2>/dev/null || true
+
+printf '%b' "${GREEN}"
+cat <<EOF
+
+================================================================================
+               HACKNETOS INSTALLATION SUCCESSFULLY COMPLETED!
+================================================================================
+
+  Target Disk        : ${REAL}
+  Root Partition     : ${ROOT}
+  Installation Mode  : ${INSTALL_MODE^^}
+  Bootloader         : $([[ "${FIRMWARE}" == uefi ]] && echo "systemd-boot (UEFI)" || echo "GRUB (BIOS)")
+  User Account       : ${NEWUSER}
+  Hostname           : ${NEWHOST}
+
+  $(if [[ "${INSTALL_MODE}" == "multiboot" ]]; then
+      echo "Multi-boot is configured. When rebooting, select HacknetOS from the boot menu."
+    else
+      echo "Clean installation finished. HacknetOS will boot on primary disk."
+    fi)
+
+================================================================================
+EOF
+printf '%b' "${RESET}"
+
+if [[ "${HACKNET_NO_REBOOT:-0}" != "1" ]]; then
+    echo "Rebooting in 5 seconds. Please remove the installation medium."
+    sleep 5
+    reboot -f
+fi

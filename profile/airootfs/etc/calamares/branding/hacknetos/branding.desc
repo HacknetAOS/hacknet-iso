@@ -1,0 +1,11 @@
+---
+# HacknetOS Calamares branding
+branding: "hacknetos"
+windowTitle: "HacknetOS Installer"
+windowIcon: "/usr/share/icons/hacknetos/hacknetos.svg"
+productName: "HacknetOS"
+version: "0.1.0"
+productIcon: "/usr/share/icons/hacknetos/hacknetos.svg"
+shortVersion: "0.1"
+shortProductName: "HacknetOS"
+device: "/dev/sda"

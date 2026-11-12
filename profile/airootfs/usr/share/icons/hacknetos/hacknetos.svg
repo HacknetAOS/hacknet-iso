@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- HacknetOS logo - hexagon with circuit pattern -->
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#060a0f;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0b1119;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#2f81f7;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#5ea6ff;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Background hexagon -->
+  <polygon points="128,8 248,72 248,184 128,248 8,184 8,72"
+           fill="url(#bgGrad)" stroke="url(#accentGrad)" stroke-width="4"/>
+
+  <!-- Inner hexagon -->
+  <polygon points="128,28 218,90 218,166 128,228 38,166 38,90"
+           fill="none" stroke="url(#accentGrad)" stroke-width="2" opacity="0.6"/>
+
+  <!-- Circuit lines -->
+  <g stroke="url(#accentGrad)" stroke-width="1.5" opacity="0.8">
+    <!-- Vertical center line -->
+    <line x1="128" y1="28" x2="128" y2="228"/>
+    <!-- Horizontal center line -->
+    <line x1="38" y1="128" x2="218" y2="128"/>
+    <!-- Diagonal lines -->
+    <line x1="78" y1="68" x2="128" y2="128"/>
+    <line x1="178" y1="68" x2="128" y2="128"/>
+    <line x1="78" y1="188" x2="128" y2="128"/>
+    <line x1="178" y1="188" x2="128" y2="128"/>
+    <!-- Corner brackets -->
+    <path d="M78,68 L98,68" stroke-width="3" stroke-linecap="round"/>
+    <path d="M78,68 L78,88" stroke-width="3" stroke-linecap="round"/>
+    <path d="M178,68 L158,68" stroke-width="3" stroke-linecap="round"/>
+    <path d="M178,68 L178,88" stroke-width="3" stroke-linecap="round"/>
+    <path d="M78,188 L98,188" stroke-width="3" stroke-linecap="round"/>
+    <path d="M78,188 L78,168" stroke-width="3" stroke-linecap="round"/>
+    <path d="M178,188 L158,188" stroke-width="3" stroke-linecap="round"/>
+    <path d="M178,188 L178,168" stroke-width="3" stroke-linecap="round"/>
+  </g>
+
+  <!-- Center node -->
+  <circle cx="128" cy="128" r="14" fill="url(#accentGrad)" opacity="0.9"/>
+  <circle cx="128" cy="128" r="8" fill="#060a0f"/>
+
+  <!-- Node ring -->
+  <circle cx="128" cy="128" r="20" fill="none" stroke="url(#accentGrad)" stroke-width="1" opacity="0.5"/>
+</svg>

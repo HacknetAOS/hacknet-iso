@@ -1,0 +1,31 @@
+# ISO build outputs & VM images
+/out/
+/work/
+*.iso
+*.iso.sha256
+*.qcow2
+*.img
+*.raw
+*.fd
+*.log
+*.tmp
+*.bak
+*.old
+__pycache__/
+*.pyc
+
+# Secrets & keys
+*.pem
+*.key
+*private*.asc
+.env
+.env.*
+
+# Editor & OS
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.idea/
+.vscode/

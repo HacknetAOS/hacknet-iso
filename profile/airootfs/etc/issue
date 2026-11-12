@@ -1,0 +1,11 @@
+HacknetOS Live ISO
+
+Welcome to HacknetOS! This is a live environment.
+
+To install HacknetOS to your disk:
+  sudo hacknetos-installer
+
+Default user: live (no password)
+Root access: sudo -i (no password)
+
+Report issues: https://github.com/hacknetos/hacknetos/issues

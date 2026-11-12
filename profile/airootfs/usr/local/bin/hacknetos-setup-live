@@ -1,0 +1,43 @@
+#!/bin/bash
+# HacknetOS live environment setup
+# Runs once on first boot of live ISO
+
+set -uo pipefail
+
+# Enable required services
+systemctl enable NetworkManager.service || true
+systemctl enable systemd-resolved.service || true
+systemctl enable bluetooth.service 2>/dev/null || true
+systemctl enable fstrim.timer || true
+systemctl enable reflector.timer || true
+
+# Setup systemd-resolved symlink for /etc/resolv.conf
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+
+# Configure live user
+if id "live" &>/dev/null; then
+    # Add to common groups
+    usermod -aG wheel,video,audio,input,network,storage,power,lp,scanner live 2>/dev/null || true
+    # Set empty password for live user (passwordless login)
+    passwd -d live 2>/dev/null || true
+fi
+
+# Apply default HacknetOS theme
+if [ ! -f /var/lib/hacknet/theme/current ]; then
+    sudo -u live hacknet-theme apply blue 2>/dev/null || true
+fi
+
+# Update desktop database
+update-desktop-database -q /usr/share/applications 2>/dev/null || true
+
+# Generate fontconfig cache
+fc-cache -f 2>/dev/null || true
+
+# Update MIME database
+update-mime-database /usr/share/mime 2>/dev/null || true
+
+# Create hacknetd socket directory
+mkdir -p /run/user/1000/hacknet
+chown -R 1000:1000 /run/user/1000/hacknet 2>/dev/null || true
+
+echo "HacknetOS live setup complete"

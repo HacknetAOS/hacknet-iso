@@ -1,0 +1,75 @@
+name: ISO CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate Scripts and Profile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check script syntax
+        run: |
+          for s in build-iso.sh fix-dev.sh profile/profiledef.sh profile/airootfs/root/customize_airootfs.sh profile/airootfs/usr/local/bin/*; do
+            if head -n1 "$s" | grep -q python; then
+              python3 -B -m py_compile "$s"
+              echo "OK (python): $s"
+            else
+              bash -n "$s"
+              echo "OK (bash): $s"
+            fi
+          done
+
+      - name: Verify staged packages in airootfs cache
+        run: |
+          for pkg in hacknet-keyring hacknet-proto hacknet-theme hacknetd hacknetctl hacknet-shell hacknet-os yay; do
+            compgen -G "profile/airootfs/var/cache/pacman/pkg/${pkg}-[0-9]*.pkg.tar.zst" >/dev/null
+            echo "OK (cached): $pkg"
+          done
+
+  build-iso:
+    name: Build Bootable ISO
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: validate
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+    steps:
+      - name: Install prerequisites
+        run: |
+          pacman -Syu --noconfirm --needed archiso base-devel git libisoburn squashfs-tools dosfstools mtools
+
+      - uses: actions/checkout@v4
+
+      - name: Build ISO image
+        run: |
+          ./build-iso.sh "$PWD/out"
+
+      - name: Compute SHA256 checksum
+        run: |
+          cd out
+          sha256sum hacknetos-*.iso > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hacknetos-iso
+          path: out/hacknetos-*.iso
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/hacknetos-*.iso
+            out/sha256sums.txt
+          generate_release_notes: true

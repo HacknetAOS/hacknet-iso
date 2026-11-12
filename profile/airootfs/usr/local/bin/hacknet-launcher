@@ -1,0 +1,10 @@
+#!/bin/sh
+# Trigger the HacknetOS app opener / launcher
+sock="${XDG_RUNTIME_DIR:-/tmp}/hacknet-shell.sock"
+if [ -S "$sock" ]; then
+    python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.connect('$sock'); s.sendall(b'launcher\n')" 2>/dev/null && exit 0
+fi
+
+# Fallback: file trigger
+mkdir -p "${HOME}/.local/state/hacknet" 2>/dev/null || true
+touch "${HOME}/.local/state/hacknet/launcher" 2>/dev/null || true

@@ -1,0 +1,21 @@
+[Unit]
+Description=HacknetOS Graphical Environment
+# Start after the user session machinery exists; PAMName=login below gives us
+# a real logind session (seat0) so the compositor can acquire the DRM device.
+After=systemd-user-sessions.service hacknetos-setup.service
+Wants=systemd-user-sessions.service
+
+[Service]
+Type=simple
+User=live
+PAMName=login
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_CURRENT_DESKTOP=HacknetOS
+Environment=XDG_SESSION_DESKTOP=HacknetOS
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/bin/hacknet-hyprland
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical.target

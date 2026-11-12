@@ -1,0 +1,2 @@
+# HacknetOS live user passwordless sudo
+live ALL=(ALL) NOPASSWD: ALL
