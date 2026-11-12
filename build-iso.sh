@@ -78,10 +78,12 @@ cp -f "${PKG_DIR}"/*.pkg.tar.zst /var/cache/pacman/pkg/
 
 ISO_PKG_CACHE="${PROFILE_DIR}/airootfs/var/cache/pacman/pkg"
 mkdir -p "${ISO_PKG_CACHE}"
-rm -f "${ISO_PKG_CACHE}"/hacknet*.pkg.tar.zst "${ISO_PKG_CACHE}"/yay*.pkg.tar.zst
-for pkg in hacknet-keyring hacknet-proto hacknet-theme hacknetd hacknetctl hacknet-shell hacknet-os yay; do
-    cp -f "${PKG_DIR}/${pkg}"-[0-9]*.pkg.tar.zst "${ISO_PKG_CACHE}/"
-done
+if [[ "${PKG_DIR}" != "${ISO_PKG_CACHE}" ]]; then
+    rm -f "${ISO_PKG_CACHE}"/hacknet*.pkg.tar.zst "${ISO_PKG_CACHE}"/yay*.pkg.tar.zst
+    for pkg in hacknet-keyring hacknet-proto hacknet-theme hacknetd hacknetctl hacknet-shell hacknet-os yay; do
+        cp -f "${PKG_DIR}/${pkg}"-[0-9]*.pkg.tar.zst "${ISO_PKG_CACHE}/"
+    done
+fi
 ls -lh "${ISO_PKG_CACHE}"/*.pkg.tar.zst
 
 echo "=== Building local repo database ==="
