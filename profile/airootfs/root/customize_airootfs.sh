@@ -42,8 +42,17 @@ pacman -U --noconfirm --overwrite '*' --config /tmp/pacman-offline.conf \
 rm -f /tmp/pacman-offline.conf
 
 if [ -x /usr/bin/pacman-key ]; then
-    /usr/bin/pacman-key --populate hacknetos 2>/dev/null || true
+    /usr/bin/pacman-key --populate hacknetos || fail "pacman-key --populate hacknetos failed"
+    /usr/bin/pacman-key --list-keys 6D9D481F4ACB997F919BCA90D9069C156B0C606C >/dev/null \
+        || fail "HacknetAOS GPG key 6D9D481F4ACB997F919BCA90D9069C156B0C606C not in pacman keyring"
+    echo "OK: HacknetAOS GPG key populated and trusted in pacman keyring"
 fi
+
+rm -f /etc/pacman.conf.pacnew
+if ! grep -q '^\[hacknetos\]' /etc/pacman.conf || ! grep -q 'https://hacknetaos.github.io/repo/\$arch' /etc/pacman.conf; then
+    fail "/etc/pacman.conf is missing [hacknetos] repository configuration"
+fi
+echo "OK: /etc/pacman.conf has [hacknetos] repository configured"
 
 if [[ ! -f /usr/share/quickshell/hacknet/shell.qml ]]; then
     fail "/usr/share/quickshell/hacknet/shell.qml missing"
