@@ -12,9 +12,9 @@ PROFILE_DIR="${SCRIPT_DIR}/profile"
 OUTPUT_DIR="${1:-${SCRIPT_DIR}/out}"
 WORK_DIR="${OUTPUT_DIR}/work"
 
-# Find package directory: check PKG_DIR env, sibling repo/x86_64, or sibling packages/pkg-out
+# Find package directory: check PKG_DIR env, sibling repo/x86_64, sibling packages/pkg-out, or ../pkg
 PKG_DIR="${PKG_DIR:-}"
-for cand in "${PKG_DIR}" "${SCRIPT_DIR}/../repo/x86_64" "${SCRIPT_DIR}/../packages/pkg-out"; do
+for cand in "${PKG_DIR}" "${SCRIPT_DIR}/../repo/x86_64" "${SCRIPT_DIR}/../packages/pkg-out" "${SCRIPT_DIR}/../pkg"; do
     if [ -n "$cand" ] && [ -d "$cand" ] && compgen -G "$cand/hacknet-os*.pkg.tar.zst" >/dev/null; then
         PKG_DIR="$cand"
         break
@@ -73,13 +73,13 @@ echo "=== /dev check complete ==="
 echo "=== Staging packages into host and ISO airootfs pacman cache ==="
 mkdir -p /var/cache/pacman/pkg
 rm -f "${PKG_DIR}"/*-debug-*.pkg.tar.zst
-rm -f /var/cache/pacman/pkg/hacknet*.pkg.tar.zst /var/cache/pacman/pkg/yay*.pkg.tar.zst
+rm -f /var/cache/pacman/pkg/hacknet*.pkg.tar.zst* /var/cache/pacman/pkg/yay*.pkg.tar.zst*
 cp -f "${PKG_DIR}"/*.pkg.tar.zst /var/cache/pacman/pkg/
 
-ISO_PKG_CACHE="${PROFILE_DIR}/airootfs/var/cache/pacman/pkg"
+ISO_PKG_CACHE=$(realpath -m "${PROFILE_DIR}/airootfs/var/cache/pacman/pkg")
 mkdir -p "${ISO_PKG_CACHE}"
 if [[ "${PKG_DIR}" != "${ISO_PKG_CACHE}" ]]; then
-    rm -f "${ISO_PKG_CACHE}"/hacknet*.pkg.tar.zst "${ISO_PKG_CACHE}"/yay*.pkg.tar.zst
+    rm -f "${ISO_PKG_CACHE}"/hacknet*.pkg.tar.zst* "${ISO_PKG_CACHE}"/yay*.pkg.tar.zst*
     for pkg in hacknet-keyring hacknet-proto hacknet-theme hacknetd hacknetctl hacknet-shell hacknet-os yay; do
         cp -f "${PKG_DIR}/${pkg}"-[0-9]*.pkg.tar.zst "${ISO_PKG_CACHE}/"
     done
