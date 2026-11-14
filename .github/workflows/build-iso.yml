@@ -57,6 +57,8 @@ jobs:
           done
 
       - name: Build ISO image
+        env:
+          HACKNET_ISO_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
         run: |
           ./build-iso.sh "$PWD/out"
 
