@@ -12,19 +12,6 @@ PROFILE_DIR="${SCRIPT_DIR}/profile"
 OUTPUT_DIR="${1:-${SCRIPT_DIR}/out}"
 WORK_DIR="${OUTPUT_DIR}/work"
 
-# Find package directory: check PKG_DIR env, sibling repo/x86_64, sibling packages/pkg-out, or ../pkg
-PKG_DIR="${PKG_DIR:-}"
-for cand in "${PKG_DIR}" "${SCRIPT_DIR}/../repo/x86_64" "${SCRIPT_DIR}/../packages/pkg-out" "${SCRIPT_DIR}/../pkg"; do
-    if [ -n "$cand" ] && [ -d "$cand" ] && compgen -G "$cand/hacknet-os*.pkg.tar.zst" >/dev/null; then
-        PKG_DIR="$cand"
-        break
-    fi
-done
-
-if [ -z "$PKG_DIR" ]; then
-    PKG_DIR="${SCRIPT_DIR}/profile/airootfs/var/cache/pacman/pkg"
-fi
-
 if [[ ${EUID} -ne 0 ]]; then
     echo "This script must be run as root (for mkarchiso)" >&2
     exit 1
@@ -33,13 +20,26 @@ fi
 OUTPUT_DIR=$(realpath -m "${OUTPUT_DIR}")
 WORK_DIR="${OUTPUT_DIR}/work"
 PROFILE_DIR=$(realpath "${PROFILE_DIR}")
-PKG_DIR=$(realpath "${PKG_DIR}")
 
 # /tmp in some build hosts is a small tmpfs with a user quota; writing multi-GB
 # package downloads there fails with "Disk quota exceeded" and yields 0-byte
 # files. Keep all scratch data on the same filesystem as the output.
 export TMPDIR="${OUTPUT_DIR}/.tmp"
 mkdir -p "${TMPDIR}"
+
+# Pull latest packages from GitHub by default unless PKG_DIR is explicitly set.
+HACKNET_REPO_URL="${HACKNET_REPO_URL:-https://github.com/HacknetAOS/repo.git}"
+PKG_DIR="${PKG_DIR:-}"
+if [[ -z "${PKG_DIR}" ]]; then
+    REPO_CLONE="${TMPDIR}/hacknet-repo"
+    rm -rf "${REPO_CLONE}"
+    echo "=== Fetching latest HacknetOS packages from ${HACKNET_REPO_URL} ==="
+    git clone --depth 1 --filter=blob:none --sparse "${HACKNET_REPO_URL}" "${REPO_CLONE}"
+    git -C "${REPO_CLONE}" sparse-checkout set x86_64
+    echo "Package repository revision: $(git -C "${REPO_CLONE}" rev-parse HEAD)"
+    PKG_DIR="${REPO_CLONE}/x86_64"
+fi
+PKG_DIR=$(realpath "${PKG_DIR}")
 
 echo "=== HacknetOS ISO Builder ==="
 echo "Profile:  ${PROFILE_DIR}"

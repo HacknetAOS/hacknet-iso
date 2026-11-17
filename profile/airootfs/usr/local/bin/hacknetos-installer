@@ -87,6 +87,83 @@ NEWPASS="${HACKNET_PASSWORD:-}"
 NEWHOST="${HACKNET_HOSTNAME:-hacknetos}"
 ASSUME_YES="${HACKNET_YES:-0}"
 
+INSTALLER_UI="${HACKNET_UI:-}"
+for _arg in "$@"; do
+    case "${_arg}" in
+        --gui) INSTALLER_UI="gui" ;;
+        --cli|--terminal) INSTALLER_UI="cli" ;;
+    esac
+done
+
+launch_gui_installer() {
+    local gui_bin="/usr/local/bin/hacknetos-installer-gui"
+    local switch_marker="/tmp/hacknetos-switch-to-cli"
+    rm -f "${switch_marker}"
+
+    if [[ ! -x "${gui_bin}" ]]; then
+        warn "GUI installer binary not found (${gui_bin}); falling back to Terminal installer."
+        return 1
+    fi
+
+    if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; then
+        "${gui_bin}" || true
+    elif command -v sway >/dev/null 2>&1; then
+        local ui_user="${SUDO_USER:-}"
+        if [[ -z "${ui_user}" ]] && id -u live >/dev/null 2>&1; then
+            ui_user="live"
+        fi
+        if [[ -n "${ui_user}" && "${ui_user}" != "root" ]]; then
+            local ui_uid runtime_dir
+            ui_uid=$(id -u "${ui_user}")
+            runtime_dir="/run/user/${ui_uid}"
+            mkdir -p "${runtime_dir}"
+            chown "${ui_user}:${ui_user}" "${runtime_dir}" 2>/dev/null || true
+            chmod 700 "${runtime_dir}" 2>/dev/null || true
+            runuser -u "${ui_user}" -- env \
+                XDG_RUNTIME_DIR="${runtime_dir}" \
+                WLR_RENDERER=pixman \
+                XDG_CURRENT_DESKTOP=sway \
+                sway -c /etc/sway/hacknetos-installer.conf >/tmp/hacknetos-gui.log 2>&1 || true
+        else
+            local runtime_dir="/tmp/runtime-root"
+            mkdir -p "${runtime_dir}"
+            chmod 700 "${runtime_dir}"
+            XDG_RUNTIME_DIR="${runtime_dir}" WLR_RENDERER=pixman \
+                sway -c /etc/sway/hacknetos-installer.conf >/tmp/hacknetos-gui.log 2>&1 || true
+        fi
+    else
+        warn "Wayland compositor (sway) not found; falling back to Terminal installer."
+        return 1
+    fi
+
+    if [[ -f "${switch_marker}" ]]; then
+        rm -f "${switch_marker}"
+        return 1
+    fi
+    return 0
+}
+
+CURRENT_TTY=$(tty 2>/dev/null || true)
+if [[ "${INSTALLER_UI}" == "gui" ]]; then
+    if launch_gui_installer; then
+        exit 0
+    fi
+elif [[ -z "${INSTALLER_UI}" && "${ASSUME_YES}" != "1" && -z "${DISK}" && -t 0 && "${CURRENT_TTY}" != /dev/ttyS* ]]; then
+    if [[ -x /usr/local/bin/hacknetos-installer-gui ]] && command -v sway >/dev/null 2>&1; then
+        show_banner
+        printf '\n%bSelect Installation Method:%b\n' "${WHITE}" "${RESET}"
+        printf '  %b[1]%b GUI Installer      %b(Graphical interface)%b\n' "${CYAN}" "${RESET}" "${DIM}" "${RESET}"
+        printf '  %b[2]%b Terminal Installer %b(Text-mode CLI)%b\n\n' "${CYAN}" "${RESET}" "${DIM}" "${RESET}"
+        read -rp "Select method [1-2] (default 1): " _ui_choice
+        _ui_choice="${_ui_choice:-1}"
+        if [[ "${_ui_choice}" == "1" ]]; then
+            if launch_gui_installer; then
+                exit 0
+            fi
+        fi
+    fi
+fi
+
 if [[ -d /sys/firmware/efi ]]; then
     FIRMWARE="uefi"
 else
@@ -538,25 +615,25 @@ cat > "${MNT}/etc/default/grub" <<EOF
 GRUB_DEFAULT=0
 GRUB_TIMEOUT=5
 GRUB_DISTRIBUTOR="HacknetOS"
-GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet console=tty0 console=ttyS0"
+GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet splash plymouth.ignore-serial-consoles vt.global_cursor_default=0 console=tty0 console=ttyS0"
 GRUB_CMDLINE_LINUX=""
 GRUB_DISABLE_OS_PROBER=false
 EOF
 
-# Initramfs configuration (clean non-archiso hooks)
+# Initramfs configuration (clean non-archiso hooks with plymouth boot splash)
 cat > "${MNT}/etc/mkinitcpio.conf" <<'EOF'
 # vim:set ft=sh:
 MODULES=()
 BINARIES=()
 FILES=()
-HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)
+HOOKS=(base udev plymouth autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)
 COMPRESSION="zstd"
 EOF
 rm -f "${MNT}/boot/initramfs-linux.img" "${MNT}/boot/initramfs-linux-fallback.img"
 rm -f "${MNT}/etc/mkinitcpio.conf.d/archiso.conf"
 mkdir -p "${MNT}/etc/mkinitcpio.conf.d"
 cat > "${MNT}/etc/mkinitcpio.conf.d/zz-hacknet-installed.conf" <<'MKEOF'
-HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)
+HOOKS=(base udev plymouth autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)
 MKEOF
 
 # Clean up live-only configs and services
@@ -677,8 +754,49 @@ EOF
 title   HacknetOS
 linux   /vmlinuz-linux
 initrd  /initramfs-linux.img
-options root=UUID=${ROOT_UUID} rw quiet console=tty0 console=ttyS0
+options root=UUID=${ROOT_UUID} rw quiet splash plymouth.ignore-serial-consoles loglevel=3 vt.global_cursor_default=0 console=ttyS0 console=tty0
 EOF
+
+    if [[ "${INSTALL_MODE}" == "multiboot" && -d "${MNT}/boot/EFI" ]]; then
+        shopt -s nullglob
+        for efi_dir in "${MNT}/boot/EFI"/*; do
+            [[ -d "${efi_dir}" ]] || continue
+            vendor=$(basename "${efi_dir}")
+            vendor_lc="${vendor,,}"
+            case "${vendor_lc}" in
+                boot|systemd|linux|microsoft|apple|hacknetos|tools) continue ;;
+            esac
+
+            efi_rel=""
+            for cand in grubx64.efi shimx64.efi systemd-bootx64.efi refind_x64.efi; do
+                if [[ -f "${efi_dir}/${cand}" ]]; then
+                    efi_rel="/EFI/${vendor}/${cand}"
+                    break
+                fi
+            done
+            if [[ -z "${efi_rel}" ]]; then
+                for cand_path in "${efi_dir}"/*.efi "${efi_dir}"/*.EFI; do
+                    [[ -f "${cand_path}" ]] || continue
+                    cand=$(basename "${cand_path}")
+                    case "${cand,,}" in
+                        mmx64.efi|fbx64.efi|mokmanager.efi|gcdx64.efi) continue ;;
+                    esac
+                    efi_rel="/EFI/${vendor}/${cand}"
+                    break
+                done
+            fi
+
+            if [[ -n "${efi_rel}" ]]; then
+                vendor_title="${vendor^}"
+                log "Adding systemd-boot chainload entry for ${vendor_title} (${efi_rel})..."
+                cat > "${MNT}/boot/loader/entries/chainload-${vendor_lc}.conf" <<EOF
+title   ${vendor_title} (EFI)
+efi     ${efi_rel}
+EOF
+            fi
+        done
+        shopt -u nullglob
+    fi
 
     ESP_PARTNUM=$(get_part_num "${ESP}")
     log "Registering UEFI boot entry on ${REAL} partition ${ESP_PARTNUM}..."

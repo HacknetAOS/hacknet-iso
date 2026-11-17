@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""HacknetOS GUI Installer (GTK4) wrapping the hacknetos-installer backend."""
+
+import json
+import os
+import subprocess
+import threading
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+SWITCH_CLI_MARKER = "/tmp/hacknetos-switch-to-cli"
+INSTALLER_BIN = "/usr/local/bin/hacknetos-installer"
+
+CSS = b"""
+window {
+    background-color: #0b0e14;
+    color: #c0c8d0;
+    font-family: "JetBrainsMono Nerd Font", "Noto Sans", sans-serif;
+}
+.header-bar {
+    background-color: #101520;
+    border-bottom: 1px solid #232b3e;
+    padding: 14px 22px;
+}
+.title-label {
+    font-size: 20px;
+    font-weight: bold;
+    color: #b9a6ff;
+}
+.subtitle-label {
+    font-size: 12px;
+    color: #79808f;
+}
+.badge {
+    background-color: #1c2436;
+    color: #7aa2f7;
+    border: 1px solid #2b3b52;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: bold;
+}
+.card {
+    background-color: #121722;
+    border: 1px solid #232b3e;
+    border-radius: 10px;
+    padding: 18px;
+}
+.section-title {
+    font-size: 15px;
+    font-weight: bold;
+    color: #e0e6f0;
+    margin-bottom: 6px;
+}
+.muted {
+    color: #79808f;
+    font-size: 12px;
+}
+.warn-text {
+    color: #e0af68;
+    font-size: 12px;
+}
+.error-text {
+    color: #f7768e;
+    font-size: 12px;
+    font-weight: bold;
+}
+.success-text {
+    color: #9ece6a;
+    font-size: 14px;
+    font-weight: bold;
+}
+button.primary {
+    background-color: #5a4fcf;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 18px;
+    font-weight: bold;
+}
+button.primary:hover {
+    background-color: #6c61e0;
+}
+button.secondary {
+    background-color: #1c2436;
+    color: #c0c8d0;
+    border: 1px solid #2b3b52;
+    border-radius: 6px;
+    padding: 8px 14px;
+}
+button.secondary:hover {
+    background-color: #253047;
+}
+textview.log-view {
+    background-color: #080b10;
+    color: #a9b1d6;
+    font-family: monospace;
+    font-size: 12px;
+    padding: 10px;
+}
+"""
+
+
+def human_size(num_bytes: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if num_bytes < 1024 or unit == "TiB":
+            return f"{num_bytes:.1f} {unit}" if unit != "B" else f"{num_bytes} B"
+        num_bytes /= 1024
+    return f"{num_bytes} B"
+
+
+def list_disks():
+    """Return list of dicts: {dev, size_str, model, partitions: [...]}."""
+    try:
+        out = subprocess.check_output(
+            ["lsblk", "-J", "-b", "-o", "NAME,PATH,SIZE,MODEL,TYPE,FSTYPE,LABEL,MOUNTPOINT"],
+            text=True,
+        )
+        data = json.loads(out)
+    except Exception:
+        return []
+
+    disks = []
+    for dev in data.get("blockdevices", []):
+        if dev.get("type") != "disk":
+            continue
+        name = dev.get("name", "")
+        size_bytes = int(dev.get("size") or 0)
+        if name.startswith(("loop", "ram", "zram", "sr", "fd")) or size_bytes < 100 * 1024 * 1024:
+            continue
+        parts = []
+        for child in dev.get("children", []) or []:
+            if child.get("type") != "part":
+                continue
+            parts.append({
+                "path": child.get("path") or f"/dev/{child.get('name')}",
+                "size": human_size(int(child.get("size") or 0)),
+                "fstype": child.get("fstype") or "unformatted",
+                "label": child.get("label") or "",
+                "mountpoint": child.get("mountpoint") or "",
+            })
+        disks.append({
+            "path": dev.get("path") or f"/dev/{name}",
+            "size": human_size(int(dev.get("size") or 0)),
+            "model": (dev.get("model") or "Generic Disk").strip(),
+            "partitions": parts,
+        })
+    return disks
+
+
+class InstallerWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="HacknetOS Installer")
+        self.set_default_size(860, 620)
+        self.firmware = "UEFI" if os.path.isdir("/sys/firmware/efi") else "BIOS"
+        self.disks = list_disks()
+        self.selected_disk_idx = 0
+        self.install_mode = "multiboot"
+        self.selected_part_path = ""
+        self.installing = False
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.set_child(root)
+
+        # Header
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        header.add_css_class("header-bar")
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        title = Gtk.Label(label="HacknetOS Installer", xalign=0)
+        title.add_css_class("title-label")
+        subtitle = Gtk.Label(label="System Installation Protocol — Graphical Mode", xalign=0)
+        subtitle.add_css_class("subtitle-label")
+        title_box.append(title)
+        title_box.append(subtitle)
+        header.append(title_box)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        header.append(spacer)
+
+        fw_badge = Gtk.Label(label=f"Firmware: {self.firmware}")
+        fw_badge.add_css_class("badge")
+        header.append(fw_badge)
+
+        self.cli_btn = Gtk.Button(label="Switch to Terminal")
+        self.cli_btn.add_css_class("secondary")
+        self.cli_btn.connect("clicked", self.on_switch_cli)
+        header.append(self.cli_btn)
+        root.append(header)
+
+        # Main stack
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.stack.set_vexpand(True)
+        self.stack.set_margin_top(20)
+        self.stack.set_margin_bottom(20)
+        self.stack.set_margin_start(28)
+        self.stack.set_margin_end(28)
+        root.append(self.stack)
+
+        self._build_disk_page()
+        self._build_user_page()
+        self._build_review_page()
+        self._build_progress_page()
+        self.stack.set_visible_child_name("disk")
+
+    def _build_disk_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        card.add_css_class("card")
+        lbl = Gtk.Label(label="1. Target Drive & Installation Mode", xalign=0)
+        lbl.add_css_class("section-title")
+        card.append(lbl)
+
+        disk_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        disk_row.append(Gtk.Label(label="Target Disk:", xalign=0))
+        self.disk_combo = Gtk.DropDown.new_from_strings(
+            [f"{d['path']}  ({d['size']}, {d['model']})" for d in self.disks] or ["No disks found"]
+        )
+        self.disk_combo.set_hexpand(True)
+        self.disk_combo.connect("notify::selected", self.on_disk_changed)
+        disk_row.append(self.disk_combo)
+
+        refresh_btn = Gtk.Button(label="Refresh")
+        refresh_btn.add_css_class("secondary")
+        refresh_btn.connect("clicked", self.on_refresh_disks)
+        disk_row.append(refresh_btn)
+        card.append(disk_row)
+
+        self.parts_label = Gtk.Label(xalign=0, wrap=True)
+        self.parts_label.add_css_class("muted")
+        card.append(self.parts_label)
+
+        self.mode_multiboot = Gtk.CheckButton(label="Multi-Boot / Install alongside existing OS (Recommended)")
+        self.mode_clean = Gtk.CheckButton(label="Clean Install (Erase entire disk and auto-partition)")
+        self.mode_clean.set_group(self.mode_multiboot)
+        self.mode_multiboot.set_active(True)
+        self.mode_multiboot.connect("toggled", self.on_mode_toggled)
+        card.append(self.mode_multiboot)
+        card.append(self.mode_clean)
+
+        self.part_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.part_row.append(Gtk.Label(label="Root Partition (/):", xalign=0))
+        self.part_combo = Gtk.DropDown.new_from_strings(["None"])
+        self.part_combo.set_hexpand(True)
+        self.part_row.append(self.part_combo)
+        card.append(self.part_row)
+
+        self.disk_warn = Gtk.Label(xalign=0, wrap=True)
+        self.disk_warn.add_css_class("warn-text")
+        card.append(self.disk_warn)
+
+        box.append(card)
+        spacer = Gtk.Box()
+        spacer.set_vexpand(True)
+        box.append(spacer)
+
+        nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        s = Gtk.Box()
+        s.set_hexpand(True)
+        nav.append(s)
+        self.disk_next = Gtk.Button(label="Next: Account Setup →")
+        self.disk_next.add_css_class("primary")
+        self.disk_next.connect("clicked", lambda *_: self.stack.set_visible_child_name("user"))
+        nav.append(self.disk_next)
+        box.append(nav)
+
+        self.stack.add_named(box, "disk")
+        self._update_disk_details()
+
+    def _build_user_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        card.add_css_class("card")
+
+        lbl = Gtk.Label(label="2. Identity & System Credentials", xalign=0)
+        lbl.add_css_class("section-title")
+        card.append(lbl)
+
+        grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        self.user_entry = Gtk.Entry(text="hacknet")
+        self.user_entry.set_hexpand(True)
+        self.pass_entry = Gtk.PasswordEntry()
+        self.pass_entry.set_show_peek_icon(True)
+        self.pass2_entry = Gtk.PasswordEntry()
+        self.pass2_entry.set_show_peek_icon(True)
+        self.host_entry = Gtk.Entry(text="hacknetos")
+
+        rows = [
+            ("Username:", self.user_entry),
+            ("Password:", self.pass_entry),
+            ("Confirm Password:", self.pass2_entry),
+            ("Hostname:", self.host_entry),
+        ]
+        for i, (text, widget) in enumerate(rows):
+            grid.attach(Gtk.Label(label=text, xalign=0), 0, i, 1, 1)
+            grid.attach(widget, 1, i, 1, 1)
+        card.append(grid)
+
+        self.user_err = Gtk.Label(xalign=0)
+        self.user_err.add_css_class("error-text")
+        card.append(self.user_err)
+
+        box.append(card)
+        spacer = Gtk.Box()
+        spacer.set_vexpand(True)
+        box.append(spacer)
+
+        nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        back = Gtk.Button(label="← Back")
+        back.add_css_class("secondary")
+        back.connect("clicked", lambda *_: self.stack.set_visible_child_name("disk"))
+        nav.append(back)
+        s = Gtk.Box()
+        s.set_hexpand(True)
+        nav.append(s)
+        nxt = Gtk.Button(label="Next: Review →")
+        nxt.add_css_class("primary")
+        nxt.connect("clicked", self.on_user_next)
+        nav.append(nxt)
+        box.append(nav)
+        self.stack.add_named(box, "user")
+
+    def _build_review_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        card.add_css_class("card")
+
+        lbl = Gtk.Label(label="3. Review Installation Summary", xalign=0)
+        lbl.add_css_class("section-title")
+        card.append(lbl)
+
+        self.summary_label = Gtk.Label(xalign=0, wrap=True)
+        card.append(self.summary_label)
+
+        box.append(card)
+        spacer = Gtk.Box()
+        spacer.set_vexpand(True)
+        box.append(spacer)
+
+        nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        back = Gtk.Button(label="← Back")
+        back.add_css_class("secondary")
+        back.connect("clicked", lambda *_: self.stack.set_visible_child_name("user"))
+        nav.append(back)
+        s = Gtk.Box()
+        s.set_hexpand(True)
+        nav.append(s)
+        install_btn = Gtk.Button(label="Start Installation")
+        install_btn.add_css_class("primary")
+        install_btn.connect("clicked", self.on_start_install)
+        nav.append(install_btn)
+        box.append(nav)
+        self.stack.add_named(box, "review")
+
+    def _build_progress_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+
+        self.progress_status = Gtk.Label(label="Installing HacknetOS...", xalign=0)
+        self.progress_status.add_css_class("section-title")
+        box.append(self.progress_status)
+
+        self.progress_bar = Gtk.ProgressBar()
+        box.append(self.progress_bar)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        self.log_view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True)
+        self.log_view.add_css_class("log-view")
+        scroll.set_child(self.log_view)
+        box.append(scroll)
+
+        nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.exit_btn = Gtk.Button(label="Exit to Shell")
+        self.exit_btn.add_css_class("secondary")
+        self.exit_btn.set_sensitive(False)
+        self.exit_btn.connect("clicked", lambda *_: self.get_application().quit())
+        nav.append(self.exit_btn)
+
+        s = Gtk.Box()
+        s.set_hexpand(True)
+        nav.append(s)
+
+        self.reboot_btn = Gtk.Button(label="Reboot Now")
+        self.reboot_btn.add_css_class("primary")
+        self.reboot_btn.set_sensitive(False)
+        self.reboot_btn.connect("clicked", lambda *_: subprocess.Popen(["sudo", "reboot", "-f"]))
+        nav.append(self.reboot_btn)
+        box.append(nav)
+
+        self.stack.add_named(box, "progress")
+
+    def on_switch_cli(self, *_):
+        if self.installing:
+            return
+        with open(SWITCH_CLI_MARKER, "w") as f:
+            f.write("1")
+        self.get_application().quit()
+
+    def on_refresh_disks(self, *_):
+        self.disks = list_disks()
+        self.disk_combo.set_model(
+            Gtk.StringList.new(
+                [f"{d['path']}  ({d['size']}, {d['model']})" for d in self.disks] or ["No disks found"]
+            )
+        )
+        self._update_disk_details()
+
+    def on_disk_changed(self, *_):
+        self._update_disk_details()
+
+    def on_mode_toggled(self, *_):
+        self._update_disk_details()
+
+    def _update_disk_details(self):
+        if not self.disks:
+            self.parts_label.set_text("No installable disks detected.")
+            self.disk_next.set_sensitive(False)
+            return
+        idx = self.disk_combo.get_selected()
+        if idx >= len(self.disks):
+            idx = 0
+        disk = self.disks[idx]
+        parts = disk["partitions"]
+        if parts:
+            lines = [
+                f"  • {p['path']}  ({p['size']}, {p['fstype']}"
+                + (f", label={p['label']}" if p["label"] else "")
+                + ")"
+                for p in parts
+            ]
+            self.parts_label.set_text("Detected partitions:\n" + "\n".join(lines))
+        else:
+            self.parts_label.set_text("No existing partitions on this disk.")
+
+        is_multi = self.mode_multiboot.get_active()
+        self.part_row.set_visible(is_multi)
+        if is_multi:
+            non_esp = [p for p in parts if p["fstype"].lower() not in ("vfat", "fat32", "fat16")]
+            if non_esp:
+                self.part_combo.set_model(
+                    Gtk.StringList.new([f"{p['path']} ({p['size']}, {p['fstype']})" for p in non_esp])
+                )
+                self._non_esp_parts = non_esp
+                self.disk_warn.set_text("Selected root partition will be formatted as ext4. Other partitions are preserved.")
+                self.disk_next.set_sensitive(True)
+            else:
+                self.part_combo.set_model(Gtk.StringList.new(["No non-EFI partitions available"]))
+                self._non_esp_parts = []
+                self.disk_warn.set_text("No suitable partition for Multi-Boot. Create a partition first or use Clean Install.")
+                self.disk_next.set_sensitive(False)
+        else:
+            self._non_esp_parts = []
+            self.disk_warn.set_text(f"WARNING: Clean Install will ERASE ALL DATA on {disk['path']}.")
+            self.disk_next.set_sensitive(True)
+
+    def on_user_next(self, *_):
+        user = self.user_entry.get_text().strip()
+        pw1 = self.pass_entry.get_text()
+        pw2 = self.pass2_entry.get_text()
+        host = self.host_entry.get_text().strip() or "hacknetos"
+        if not user or " " in user:
+            self.user_err.set_text("Please enter a valid username (no spaces).")
+            return
+        if not pw1:
+            self.user_err.set_text("Password cannot be empty.")
+            return
+        if pw1 != pw2:
+            self.user_err.set_text("Passwords do not match.")
+            return
+        self.user_err.set_text("")
+
+        disk = self.disks[self.disk_combo.get_selected()]
+        is_multi = self.mode_multiboot.get_active()
+        part = self._non_esp_parts[self.part_combo.get_selected()]["path"] if is_multi else "Auto-partition"
+        mode_str = "Multi-Boot (Preserve other partitions)" if is_multi else "Clean Install (Erase entire disk)"
+        self.summary_label.set_text(
+            f"Target Disk       : {disk['path']} ({disk['size']})\n"
+            f"Firmware Mode     : {self.firmware}\n"
+            f"Installation Mode : {mode_str}\n"
+            f"Root Partition    : {part}\n"
+            f"Username          : {user}\n"
+            f"Hostname          : {host}"
+        )
+        self.stack.set_visible_child_name("review")
+
+    def on_start_install(self, *_):
+        self.installing = True
+        self.cli_btn.set_sensitive(False)
+        self.stack.set_visible_child_name("progress")
+
+        disk = self.disks[self.disk_combo.get_selected()]["path"]
+        is_multi = self.mode_multiboot.get_active()
+        env = os.environ.copy()
+        env.update({
+            "HACKNET_YES": "1",
+            "HACKNET_NO_REBOOT": "1",
+            "HACKNET_DISK": disk,
+            "HACKNET_MODE": "multiboot" if is_multi else "clean",
+            "HACKNET_USER": self.user_entry.get_text().strip(),
+            "HACKNET_PASSWORD": self.pass_entry.get_text(),
+            "HACKNET_HOSTNAME": self.host_entry.get_text().strip() or "hacknetos",
+        })
+        if is_multi:
+            env["HACKNET_PARTITION"] = self._non_esp_parts[self.part_combo.get_selected()]["path"]
+
+        GLib.timeout_add(120, self._pulse_progress)
+        threading.Thread(target=self._run_installer, args=(env,), daemon=True).start()
+
+    def _pulse_progress(self):
+        if not self.installing:
+            return False
+        self.progress_bar.pulse()
+        return True
+
+    def _append_log(self, line: str):
+        buf = self.log_view.get_buffer()
+        buf.insert(buf.get_end_iter(), line)
+        mark = buf.create_mark(None, buf.get_end_iter(), False)
+        self.log_view.scroll_to_mark(mark, 0.0, False, 0.0, 0.0)
+        return False
+
+    def _run_installer(self, env):
+        cmd = ["sudo", "-E", INSTALLER_BIN, "--cli"]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
+        )
+        for line in proc.stdout:
+            GLib.idle_add(self._append_log, line)
+        rc = proc.wait()
+        GLib.idle_add(self._on_install_done, rc)
+
+    def _on_install_done(self, rc: int):
+        self.installing = False
+        self.exit_btn.set_sensitive(True)
+        if rc == 0:
+            self.progress_bar.set_fraction(1.0)
+            self.progress_status.set_text("HacknetOS installation completed successfully!")
+            self.progress_status.add_css_class("success-text")
+            self.reboot_btn.set_sensitive(True)
+        else:
+            self.progress_status.set_text(f"Installation failed (exit code {rc}). See log below.")
+            self.progress_status.add_css_class("error-text")
+        return False
+
+
+def main():
+    app = Gtk.Application(application_id="org.hacknetos.installer")
+    app.connect("activate", lambda a: InstallerWindow(a).present())
+    return app.run(None)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
