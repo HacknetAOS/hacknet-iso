@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=HacknetOS
+Description=HacknetOS boot splash screen (placeholder logo and text)
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/hacknetos
+ScriptFile=/usr/share/plymouth/themes/hacknetos/hacknetos.script

@@ -1,0 +1,60 @@
+// HacknetOS temporary boot splash theme
+// Replace logo.png with final art assets when ready.
+
+Window.SetBackgroundTopColor(0.043, 0.055, 0.078);
+Window.SetBackgroundBottomColor(0.043, 0.055, 0.078);
+
+screen_width = Window.GetWidth();
+screen_height = Window.GetHeight();
+
+logo_image = Image("logo.png");
+logo_sprite = Sprite(logo_image);
+logo_sprite.SetX(screen_width / 2 - logo_image.GetWidth() / 2);
+logo_sprite.SetY(screen_height / 2 - logo_image.GetHeight() / 2 - 40);
+logo_sprite.SetZ(10);
+
+title_image = Image.Text("HacknetOS", 0.85, 0.88, 0.96, 1.0, "Sans Bold 20");
+title_sprite = Sprite(title_image);
+title_sprite.SetX(screen_width / 2 - title_image.GetWidth() / 2);
+title_sprite.SetY(screen_height / 2 + logo_image.GetHeight() / 2 - 16);
+title_sprite.SetZ(10);
+
+status_sprite = Sprite();
+status_sprite.SetZ(10);
+
+fun set_status_text(text) {
+    status_image = Image.Text(text, 0.55, 0.62, 0.78, 1.0, "Sans 11");
+    status_sprite.SetImage(status_image);
+    status_sprite.SetX(screen_width / 2 - status_image.GetWidth() / 2);
+    status_sprite.SetY(screen_height / 2 + logo_image.GetHeight() / 2 + 24);
+}
+
+set_status_text("Loading system...");
+
+angle = 0;
+fun refresh_callback() {
+    angle += 0.08;
+    if (angle >= 6.2831853) {
+        angle -= 6.2831853;
+    }
+    rotated = logo_image.Rotate(angle);
+    logo_sprite.SetImage(rotated);
+    logo_sprite.SetX(screen_width / 2 - rotated.GetWidth() / 2);
+    logo_sprite.SetY(screen_height / 2 - rotated.GetHeight() / 2 - 40);
+}
+Plymouth.SetRefreshFunction(refresh_callback);
+
+fun message_callback(text) {
+    if (text && text != "") {
+        set_status_text(text);
+    }
+}
+Plymouth.SetMessageFunction(message_callback);
+Plymouth.SetDisplayMessageFunction(message_callback);
+
+fun quit_callback() {
+    logo_sprite.SetOpacity(0);
+    title_sprite.SetOpacity(0);
+    status_sprite.SetOpacity(0);
+}
+Plymouth.SetQuitFunction(quit_callback);

@@ -18,6 +18,7 @@ file_permissions=(
     ["/root"]="0:0:750"
     ["/usr/local/bin/hacknetos-autoinstall"]="0:0:755"
     ["/usr/local/bin/hacknetos-installer"]="0:0:755"
+    ["/usr/local/bin/hacknetos-installer-gui"]="0:0:755"
     ["/usr/local/bin/hacknetos-setup-live"]="0:0:755"
     ["/usr/local/bin/hacknetos-create-live-user"]="0:0:755"
 )

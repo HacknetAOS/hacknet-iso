@@ -312,7 +312,11 @@ cat > /home/live/.bash_profile <<'PROFILE'
 if [ -z "${HACKNET_INSTALLER_STARTED:-}" ] \
    && ! grep -q 'hacknetos\.autoinstall' /proc/cmdline 2>/dev/null; then
     export HACKNET_INSTALLER_STARTED=1
-    exec sudo /usr/local/bin/hacknetos-installer
+    if [ "$(tty 2>/dev/null)" = /dev/ttyS0 ] || [ "$(tty 2>/dev/null)" = /dev/ttyS1 ]; then
+        exec sudo /usr/local/bin/hacknetos-installer --cli
+    else
+        exec sudo /usr/local/bin/hacknetos-installer
+    fi
 fi
 
 # Unattended install or an aborted installer: leave a usable shell.

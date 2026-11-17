@@ -14,6 +14,7 @@ base
 linux
 linux-firmware
 mkinitcpio
+plymouth
 systemd-sysvcompat
 archiso
 mkinitcpio-archiso
@@ -71,6 +72,8 @@ upower
 # Optional integrations used by hacknet-theme.
 gtk3
 gtk4
+python
+python-gobject
 qt6ct
 starship
 
