@@ -111,8 +111,77 @@ def human_size(num_bytes: int) -> str:
     return f"{num_bytes} B"
 
 
+def detect_os_and_shrink(path: str, fstype: str, size_bytes: int):
+    """Return (os_label, shrinkable_mib) for a partition."""
+    fs = (fstype or "").lower()
+    if fs == "swap":
+        return "Linux Swap", 0
+    if fs in ("vfat", "fat32", "fat16"):
+        return "EFI / FAT", 0
+
+    os_label = ""
+    used_mib = None
+    if fs in ("ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "ntfs"):
+        import tempfile
+        mnt = tempfile.mkdtemp(prefix="hacknet-probe-")
+        try:
+            res = subprocess.run(["sudo", "mount", "-o", "ro", path, mnt], capture_output=True)
+            if res.returncode == 0:
+                try:
+                    for os_rel in (os.path.join(mnt, "etc/os-release"), os.path.join(mnt, "usr/lib/os-release")):
+                        if os.path.isfile(os_rel):
+                            with open(os_rel, "r", errors="ignore") as f:
+                                for line in f:
+                                    if line.startswith("PRETTY_NAME="):
+                                        os_label = line.split("=", 1)[1].strip().strip('"')
+                                        break
+                        if os_label:
+                            break
+                    if not os_label and os.path.isdir(os.path.join(mnt, "Windows/System32")):
+                        os_label = "Microsoft Windows"
+                    df_out = subprocess.check_output(["df", "-BM", "--output=used", mnt], text=True)
+                    used_str = "".join(c for c in df_out.strip().splitlines()[-1] if c.isdigit())
+                    if used_str:
+                        used_mib = int(used_str)
+                finally:
+                    subprocess.run(["sudo", "umount", mnt], capture_output=True)
+        except Exception:
+            pass
+        finally:
+            try:
+                os.rmdir(mnt)
+            except OSError:
+                pass
+
+    shrink_mib = 0
+    size_mib = size_bytes // (1024 * 1024)
+    if fs in ("ext2", "ext3", "ext4", "ntfs", "btrfs") and used_mib is not None:
+        min_safe_mib = used_mib + 1024
+        if size_mib > min_safe_mib:
+            shrink_mib = size_mib - min_safe_mib
+    return os_label, shrink_mib
+
+
+def get_largest_free_gap_mib(disk_path: str) -> int:
+    try:
+        out = subprocess.check_output(
+            ["sudo", "parted", "-m", disk_path, "unit", "MiB", "print", "free"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        best = 0
+        for line in out.splitlines():
+            cols = line.strip().rstrip(";").split(":")
+            if len(cols) >= 5 and cols[4].startswith("free"):
+                s = int(float(cols[1].replace("MiB", "")))
+                e = int(float(cols[2].replace("MiB", "")))
+                best = max(best, e - s)
+        return best
+    except Exception:
+        return 0
+
+
 def list_disks():
-    """Return list of dicts: {dev, size_str, model, partitions: [...]}."""
+    """Return list of dicts: {path, size, model, free_gap_mib, partitions: [...]}."""
     try:
         out = subprocess.check_output(
             ["lsblk", "-J", "-b", "-o", "NAME,PATH,SIZE,MODEL,TYPE,FSTYPE,LABEL,MOUNTPOINT"],
@@ -130,21 +199,30 @@ def list_disks():
         size_bytes = int(dev.get("size") or 0)
         if name.startswith(("loop", "ram", "zram", "sr", "fd")) or size_bytes < 100 * 1024 * 1024:
             continue
+        dpath = dev.get("path") or f"/dev/{name}"
         parts = []
         for child in dev.get("children", []) or []:
             if child.get("type") != "part":
                 continue
+            ppath = child.get("path") or f"/dev/{child.get('name')}"
+            psize_b = int(child.get("size") or 0)
+            pfstype = child.get("fstype") or "unformatted"
+            os_label, shrink_mib = detect_os_and_shrink(ppath, pfstype, psize_b)
             parts.append({
-                "path": child.get("path") or f"/dev/{child.get('name')}",
-                "size": human_size(int(child.get("size") or 0)),
-                "fstype": child.get("fstype") or "unformatted",
+                "path": ppath,
+                "size": human_size(psize_b),
+                "size_mib": psize_b // (1024 * 1024),
+                "fstype": pfstype,
                 "label": child.get("label") or "",
                 "mountpoint": child.get("mountpoint") or "",
+                "os": os_label,
+                "shrink_mib": shrink_mib,
             })
         disks.append({
-            "path": dev.get("path") or f"/dev/{name}",
-            "size": human_size(int(dev.get("size") or 0)),
+            "path": dpath,
+            "size": human_size(size_bytes),
             "model": (dev.get("model") or "Generic Disk").strip(),
+            "free_gap_mib": get_largest_free_gap_mib(dpath),
             "partitions": parts,
         })
     return disks
@@ -248,12 +326,37 @@ class InstallerWindow(Gtk.ApplicationWindow):
         card.append(self.mode_multiboot)
         card.append(self.mode_clean)
 
+        self.mb_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        strat_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        strat_row.append(Gtk.Label(label="Install Method:", xalign=0))
+        self.mb_strategy_combo = Gtk.DropDown.new_from_strings(["None"])
+        self.mb_strategy_combo.set_hexpand(True)
+        self.mb_strategy_combo.connect("notify::selected", self.on_mb_strategy_changed)
+        strat_row.append(self.mb_strategy_combo)
+        self.mb_box.append(strat_row)
+
         self.part_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        self.part_row.append(Gtk.Label(label="Root Partition (/):", xalign=0))
+        self.part_label = Gtk.Label(label="Target Partition:", xalign=0)
+        self.part_row.append(self.part_label)
         self.part_combo = Gtk.DropDown.new_from_strings(["None"])
         self.part_combo.set_hexpand(True)
+        self.part_combo.connect("notify::selected", self.on_part_changed)
         self.part_row.append(self.part_combo)
-        card.append(self.part_row)
+        self.mb_box.append(self.part_row)
+
+        self.resize_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.resize_row.append(Gtk.Label(label="HacknetOS Size (GiB):", xalign=0))
+        self.resize_spin = Gtk.SpinButton.new_with_range(4, 512, 1)
+        self.resize_spin.set_value(12)
+        self.resize_spin.connect("value-changed", self.on_resize_changed)
+        self.resize_row.append(self.resize_spin)
+        self.resize_preview = Gtk.Label(xalign=0, wrap=True)
+        self.resize_preview.add_css_class("muted")
+        self.resize_row.append(self.resize_preview)
+        self.mb_box.append(self.resize_row)
+
+        card.append(self.mb_box)
 
         self.disk_warn = Gtk.Label(xalign=0, wrap=True)
         self.disk_warn.add_css_class("warn-text")
@@ -421,6 +524,33 @@ class InstallerWindow(Gtk.ApplicationWindow):
     def on_mode_toggled(self, *_):
         self._update_disk_details()
 
+    def on_mb_strategy_changed(self, *_):
+        self._update_mb_controls()
+
+    def on_part_changed(self, *_):
+        self._update_mb_controls(refresh_models=False)
+
+    def on_resize_changed(self, *_):
+        self._update_resize_preview()
+
+    def _update_resize_preview(self):
+        if not getattr(self, "_mb_strategies", []):
+            return
+        idx = self.mb_strategy_combo.get_selected()
+        if idx >= len(self._mb_strategies) or self._mb_strategies[idx][0] != "resize":
+            return
+        if not self._resizable_parts:
+            return
+        pidx = self.part_combo.get_selected()
+        if pidx >= len(self._resizable_parts):
+            pidx = 0
+        p = self._resizable_parts[pidx]
+        alloc_gib = int(self.resize_spin.get_value())
+        total_gib = p["size_mib"] / 1024.0
+        remain_gib = max(0.0, total_gib - alloc_gib)
+        lbl = p["os"] or p["path"]
+        self.resize_preview.set_text(f"{lbl}: {total_gib:.1f} → {remain_gib:.1f} GiB  |  HacknetOS: {alloc_gib} GiB")
+
     def _update_disk_details(self):
         if not self.disks:
             self.parts_label.set_text("No installable disks detected.")
@@ -432,35 +562,105 @@ class InstallerWindow(Gtk.ApplicationWindow):
         disk = self.disks[idx]
         parts = disk["partitions"]
         if parts:
-            lines = [
-                f"  • {p['path']}  ({p['size']}, {p['fstype']}"
-                + (f", label={p['label']}" if p["label"] else "")
-                + ")"
-                for p in parts
-            ]
+            lines = []
+            for p in parts:
+                extra = [p["size"], p["fstype"]]
+                if p["os"]:
+                    extra.append(f"OS: {p['os']}")
+                elif p["label"]:
+                    extra.append(f"label={p['label']}")
+                lines.append(f"  • {p['path']}  ({', '.join(extra)})")
+            if disk["free_gap_mib"] >= 4096:
+                lines.append(f"  • Unallocated free space: {disk['free_gap_mib'] / 1024.0:.1f} GiB")
             self.parts_label.set_text("Detected partitions:\n" + "\n".join(lines))
         else:
             self.parts_label.set_text("No existing partitions on this disk.")
 
         is_multi = self.mode_multiboot.get_active()
-        self.part_row.set_visible(is_multi)
-        if is_multi:
-            non_esp = [p for p in parts if p["fstype"].lower() not in ("vfat", "fat32", "fat16")]
-            if non_esp:
-                self.part_combo.set_model(
-                    Gtk.StringList.new([f"{p['path']} ({p['size']}, {p['fstype']})" for p in non_esp])
-                )
-                self._non_esp_parts = non_esp
-                self.disk_warn.set_text("Selected root partition will be formatted as ext4. Other partitions are preserved.")
-                self.disk_next.set_sensitive(True)
-            else:
-                self.part_combo.set_model(Gtk.StringList.new(["No non-EFI partitions available"]))
-                self._non_esp_parts = []
-                self.disk_warn.set_text("No suitable partition for Multi-Boot. Create a partition first or use Clean Install.")
-                self.disk_next.set_sensitive(False)
-        else:
+        self.mb_box.set_visible(is_multi)
+        if not is_multi:
+            self._mb_strategies = []
             self._non_esp_parts = []
+            self._resizable_parts = []
             self.disk_warn.set_text(f"WARNING: Clean Install will ERASE ALL DATA on {disk['path']}.")
+            self.disk_next.set_sensitive(True)
+            return
+
+        non_esp = [p for p in parts if p["fstype"].lower() not in ("vfat", "fat32", "fat16", "swap")]
+        resizable = [p for p in non_esp if p["shrink_mib"] >= 4096]
+        self._non_esp_parts = non_esp
+        self._resizable_parts = resizable
+
+        strategies = []
+        if disk["free_gap_mib"] >= 4096:
+            strategies.append(("free_space", f"Install into unallocated free space ({disk['free_gap_mib'] / 1024.0:.1f} GiB available)"))
+        if resizable:
+            strategies.append(("resize", "Shrink an existing OS/data partition to make room"))
+        if non_esp:
+            strategies.append(("use_part", "Format an existing partition directly (overwrites selected partition)"))
+        self._mb_strategies = strategies
+
+        if not strategies:
+            self.mb_strategy_combo.set_model(Gtk.StringList.new(["No multi-boot space available — use Clean Install"]))
+            self.part_row.set_visible(False)
+            self.resize_row.set_visible(False)
+            self.disk_warn.set_text("No free space or partitions available for Multi-Boot.")
+            self.disk_next.set_sensitive(False)
+            return
+
+        self.mb_strategy_combo.set_model(Gtk.StringList.new([s[1] for s in strategies]))
+        self._update_mb_controls()
+
+    def _update_mb_controls(self, refresh_models=True):
+        if not getattr(self, "_mb_strategies", []):
+            return
+        idx = self.mb_strategy_combo.get_selected()
+        if idx >= len(self._mb_strategies):
+            idx = 0
+        kind = self._mb_strategies[idx][0]
+
+        if kind == "free_space":
+            self.part_row.set_visible(False)
+            self.resize_row.set_visible(False)
+            self.disk_warn.set_text("A new HacknetOS partition will be created in unallocated free space. Existing OSes remain untouched.")
+            self.disk_next.set_sensitive(True)
+        elif kind == "resize":
+            self.part_row.set_visible(True)
+            self.resize_row.set_visible(True)
+            self.part_label.set_text("Partition to Shrink:")
+            if refresh_models:
+                self.part_combo.set_model(Gtk.StringList.new([
+                    f"{p['path']} ({p['os'] or p['fstype']}, {p['size']}, up to {p['shrink_mib'] // 1024} GiB free)"
+                    for p in self._resizable_parts
+                ]))
+            pidx = self.part_combo.get_selected()
+            if pidx >= len(self._resizable_parts):
+                pidx = 0
+            max_gib = max(4, self._resizable_parts[pidx]["shrink_mib"] // 1024)
+            self.resize_spin.set_range(4, max_gib)
+            default_gib = min(max_gib, max(8, max_gib // 2))
+            if refresh_models or self.resize_spin.get_value() > max_gib:
+                self.resize_spin.set_value(default_gib)
+            self._update_resize_preview()
+            self.disk_warn.set_text("Selected partition will be shrunk non-destructively and a new partition created for HacknetOS.")
+            self.disk_next.set_sensitive(True)
+        else:
+            self.part_row.set_visible(True)
+            self.resize_row.set_visible(False)
+            self.part_label.set_text("Partition to Format:")
+            if refresh_models:
+                self.part_combo.set_model(Gtk.StringList.new([
+                    f"{p['path']} ({p['size']}, {p['fstype']}" + (f", OS: {p['os']}" if p["os"] else "") + ")"
+                    for p in self._non_esp_parts
+                ]))
+            pidx = self.part_combo.get_selected()
+            if pidx >= len(self._non_esp_parts):
+                pidx = 0
+            p = self._non_esp_parts[pidx]
+            if p["os"]:
+                self.disk_warn.set_text(f"WARNING: {p['path']} contains '{p['os']}'! Formatting it will ERASE that OS.")
+            else:
+                self.disk_warn.set_text("Selected partition will be formatted as ext4. Other partitions are preserved.")
             self.disk_next.set_sensitive(True)
 
     def on_user_next(self, *_):
@@ -481,7 +681,18 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
         disk = self.disks[self.disk_combo.get_selected()]
         is_multi = self.mode_multiboot.get_active()
-        part = self._non_esp_parts[self.part_combo.get_selected()]["path"] if is_multi else "Auto-partition"
+        if is_multi:
+            kind = self._mb_strategies[self.mb_strategy_combo.get_selected()][0]
+            if kind == "free_space":
+                part = f"New partition in unallocated space ({disk['free_gap_mib'] / 1024.0:.1f} GiB)"
+            elif kind == "resize":
+                rp = self._resizable_parts[self.part_combo.get_selected()]
+                gib = int(self.resize_spin.get_value())
+                part = f"New {gib} GiB partition (shrunk from {rp['path']})"
+            else:
+                part = self._non_esp_parts[self.part_combo.get_selected()]["path"] + " (WILL BE FORMATTED)"
+        else:
+            part = "Auto-partition"
         mode_str = "Multi-Boot (Preserve other partitions)" if is_multi else "Clean Install (Erase entire disk)"
         self.summary_label.set_text(
             f"Target Disk       : {disk['path']} ({disk['size']})\n"
@@ -511,7 +722,14 @@ class InstallerWindow(Gtk.ApplicationWindow):
             "HACKNET_HOSTNAME": self.host_entry.get_text().strip() or "hacknetos",
         })
         if is_multi:
-            env["HACKNET_PARTITION"] = self._non_esp_parts[self.part_combo.get_selected()]["path"]
+            kind = self._mb_strategies[self.mb_strategy_combo.get_selected()][0]
+            if kind == "free_space":
+                env["HACKNET_USE_FREE_SPACE"] = "1"
+            elif kind == "resize":
+                env["HACKNET_RESIZE_PART"] = self._resizable_parts[self.part_combo.get_selected()]["path"]
+                env["HACKNET_RESIZE_MB"] = str(int(self.resize_spin.get_value()) * 1024)
+            else:
+                env["HACKNET_PARTITION"] = self._non_esp_parts[self.part_combo.get_selected()]["path"]
 
         GLib.timeout_add(120, self._pulse_progress)
         threading.Thread(target=self._run_installer, args=(env,), daemon=True).start()

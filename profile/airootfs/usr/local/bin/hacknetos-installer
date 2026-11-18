@@ -81,11 +81,15 @@ command -v blkid     >/dev/null || die "util-linux (blkid) is missing"
 MNT=/mnt
 DISK="${HACKNET_DISK:-}"
 TARGET_PART="${HACKNET_PARTITION:-}"
+RESIZE_PART="${HACKNET_RESIZE_PART:-}"
+RESIZE_MB="${HACKNET_RESIZE_MB:-}"
+USE_FREE_SPACE="${HACKNET_USE_FREE_SPACE:-0}"
 INSTALL_MODE="${HACKNET_MODE:-}"
 NEWUSER="${HACKNET_USER:-}"
 NEWPASS="${HACKNET_PASSWORD:-}"
 NEWHOST="${HACKNET_HOSTNAME:-hacknetos}"
 ASSUME_YES="${HACKNET_YES:-0}"
+MULTIBOOT_ACTION=""
 
 INSTALLER_UI="${HACKNET_UI:-}"
 for _arg in "$@"; do
@@ -248,6 +252,135 @@ detect_os() {
     echo "$os_name"
 }
 
+# ---------------------------------------------------------------- partition & resize helpers
+get_part_bounds_mib() { # get_part_bounds_mib <disk> <part_num> -> "start_mib end_mib size_mib"
+    parted -m "$1" unit MiB print 2>/dev/null | awk -F: -v n="$2" '
+        $1 == n {
+            gsub(/MiB/, "", $2); gsub(/MiB/, "", $3); gsub(/MiB/, "", $4);
+            printf "%d %d %d\n", int($2+0.5), int($3), int($4);
+            exit
+        }'
+}
+
+find_largest_free_gap() { # find_largest_free_gap <disk> -> "start_mib end_mib size_mib"
+    parted -m "$1" unit MiB print free 2>/dev/null | awk -F: '
+        $5 ~ /^free/ {
+            gsub(/MiB/, "", $2); gsub(/MiB/, "", $3); gsub(/MiB/, "", $4);
+            s = int($2 + 0.99); e = int($3); sz = e - s;
+            if (sz > best_sz) { best_sz = sz; best_s = s; best_e = e; }
+        }
+        END { if (best_sz > 0) printf "%d %d %d\n", best_s, best_e, best_sz; }'
+}
+
+get_min_fs_mib() { # get_min_fs_mib <part> <fstype> -> min_mib (with 512 MiB buffer), or 0 if unsupported
+    local part="$1" fstype="$2"
+    case "$fstype" in
+        ext2|ext3|ext4)
+            e2fsck -f -p "$part" >/dev/null 2>&1 || true
+            local min_blocks blk_size
+            min_blocks=$(resize2fs -P "$part" 2>/dev/null | awk -F: '/minimum size/{gsub(/[^0-9]/,"",$2); print $2; exit}')
+            blk_size=$(dumpe2fs -h "$part" 2>/dev/null | awk -F: '/^Block size:/{gsub(/[^0-9]/,"",$2); print $2; exit}')
+            blk_size="${blk_size:-4096}"
+            if [[ -n "$min_blocks" && "$min_blocks" -gt 0 ]]; then
+                echo $(( (min_blocks * blk_size) / 1048576 + 512 ))
+                return
+            fi
+            ;;
+        ntfs)
+            if command -v ntfsresize >/dev/null 2>&1; then
+                local min_bytes
+                min_bytes=$(ntfsresize -i -f "$part" 2>/dev/null | awk '/You might resize at/{print $5; exit}')
+                if [[ -n "$min_bytes" && "$min_bytes" -gt 0 ]]; then
+                    echo $(( min_bytes / 1048576 + 512 ))
+                    return
+                fi
+            fi
+            ;;
+        btrfs)
+            local tmp_mnt used_mib
+            tmp_mnt=$(mktemp -d /tmp/hacknet-btrfs.XXXXXX 2>/dev/null || true)
+            if [[ -n "$tmp_mnt" ]] && mount -o ro "$part" "$tmp_mnt" 2>/dev/null; then
+                used_mib=$(df -BM --output=used "$tmp_mnt" 2>/dev/null | tail -n1 | tr -dc '0-9')
+                umount "$tmp_mnt" 2>/dev/null || true
+                rmdir "$tmp_mnt" 2>/dev/null || true
+                if [[ -n "$used_mib" ]]; then
+                    echo $(( used_mib + 1024 ))
+                    return
+                fi
+            fi
+            ;;
+    esac
+    echo 0
+}
+
+create_part_in_range() { # create_part_in_range <disk> <start_mib> <end_mib> -> echoes new part device
+    local disk="$1" start_mib="$2" end_mib="$3"
+    local before after pt_type new_part=""
+    before=$(lsblk -lpno NAME,TYPE "$disk" 2>/dev/null | awk '$2=="part"{print $1}')
+    pt_type=$(parted -m "$disk" print 2>/dev/null | awk -F: 'NR==2{print $6}')
+    if [[ "$pt_type" == "gpt" ]]; then
+        parted -s "$disk" -- mkpart hacknet ext4 "${start_mib}MiB" "${end_mib}MiB" >/dev/null
+    else
+        parted -s "$disk" -- mkpart primary ext4 "${start_mib}MiB" "${end_mib}MiB" >/dev/null
+    fi
+    partprobe "$disk" 2>/dev/null || true
+    udevadm settle 2>/dev/null || sleep 2
+    after=$(lsblk -lpno NAME,TYPE "$disk" 2>/dev/null | awk '$2=="part"{print $1}')
+    new_part=$(comm -13 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort) | head -n1)
+    [[ -n "$new_part" && -b "$new_part" ]] || die "Failed to detect newly created partition on ${disk}"
+    echo "$new_part"
+}
+
+shrink_and_create_part() { # shrink_and_create_part <disk> <part> <shrink_mib> -> echoes new part device
+    local disk="$1" part="$2" shrink_mib="$3"
+    local pnum pfstype bounds start_mib old_end_mib size_mib new_size_mib new_end_mib min_mib
+    pnum=$(get_part_num "$part")
+    pfstype=$(lsblk -dno FSTYPE "$part" 2>/dev/null || blkid -s TYPE -o value "$part" 2>/dev/null || true)
+    bounds=$(get_part_bounds_mib "$disk" "$pnum")
+    read -r start_mib old_end_mib size_mib <<< "$bounds"
+    [[ -n "$size_mib" && "$size_mib" -gt 0 ]] || die "Cannot read bounds for ${part}"
+
+    min_mib=$(get_min_fs_mib "$part" "$pfstype")
+    [[ "$min_mib" -gt 0 ]] || die "Filesystem '${pfstype}' on ${part} does not support safe resizing"
+    new_size_mib=$((size_mib - shrink_mib))
+    [[ "$new_size_mib" -ge "$min_mib" ]] || die "Cannot shrink ${part} below minimum safe size (${min_mib} MiB)"
+    new_end_mib=$((start_mib + new_size_mib))
+
+    umount "$part" 2>/dev/null || true
+    case "$pfstype" in
+        ext2|ext3|ext4)
+            log "Checking and shrinking ${pfstype} filesystem on ${part} to $((new_size_mib - 64)) MiB..." >&2
+            e2fsck -f -p "$part" >/dev/null 2>&1 || e2fsck -f -y "$part" >/dev/null 2>&1 || true
+            resize2fs "$part" "$((new_size_mib - 64))M" >&2
+            ;;
+        ntfs)
+            log "Shrinking NTFS filesystem on ${part} to $((new_size_mib - 64)) MiB..." >&2
+            ntfsresize -f -s "$((new_size_mib - 64))M" "$part" >&2
+            ;;
+        btrfs)
+            local tmp_mnt
+            tmp_mnt=$(mktemp -d /tmp/hacknet-btrfs-rsz.XXXXXX)
+            mount "$part" "$tmp_mnt"
+            btrfs filesystem resize "$((new_size_mib - 64))M" "$tmp_mnt" >&2
+            umount "$tmp_mnt"
+            rmdir "$tmp_mnt"
+            ;;
+    esac
+
+    log "Shrinking partition ${part} boundary to ${new_end_mib} MiB..." >&2
+    yes | parted ---pretend-input-tty "$disk" resizepart "$pnum" "${new_end_mib}MiB" >/dev/null 2>&1 || true
+    partprobe "$disk" 2>/dev/null || true
+    udevadm settle 2>/dev/null || sleep 2
+
+    if [[ "$pfstype" =~ ^ext[234]$ ]]; then
+        resize2fs "$part" >/dev/null 2>&1 || true
+        e2fsck -f -p "$part" >/dev/null 2>&1 || true
+    fi
+
+    log "Creating new HacknetOS partition (${new_end_mib}MiB -> ${old_end_mib}MiB)..." >&2
+    create_part_in_range "$disk" "$new_end_mib" "$old_end_mib"
+}
+
 # ---------------------------------------------------------------- disk selection
 show_banner
 
@@ -379,13 +512,19 @@ for p in "${PARTS[@]}"; do
     CANDIDATE_PARTS+=("$p")
 done
 
-# If HACKNET_PARTITION was provided, auto-select multi-boot
-if [[ -n "${TARGET_PART}" ]]; then
+# If HACKNET_PARTITION, HACKNET_RESIZE_PART, or HACKNET_USE_FREE_SPACE was provided, auto-select multi-boot
+if [[ -n "${TARGET_PART}" || -n "${RESIZE_PART}" || "${USE_FREE_SPACE}" == "1" ]]; then
     INSTALL_MODE="multiboot"
 fi
 
+FREE_GAP_INFO=$(find_largest_free_gap "${REAL}")
+FREE_GAP_START=0; FREE_GAP_END=0; FREE_GAP_MIB=0
+if [[ -n "${FREE_GAP_INFO}" ]]; then
+    read -r FREE_GAP_START FREE_GAP_END FREE_GAP_MIB <<< "${FREE_GAP_INFO}"
+fi
+
 if [[ -z "${INSTALL_MODE}" ]]; then
-    if [[ ${#PARTS[@]} -gt 0 && ${#CANDIDATE_PARTS[@]} -gt 0 ]]; then
+    if [[ ${#PARTS[@]} -gt 0 && ( ${#CANDIDATE_PARTS[@]} -gt 0 || ${FREE_GAP_MIB} -ge 4096 ) ]]; then
         echo "Choose installation strategy:"
         echo "  [1] Multi-Boot / Install alongside existing Linux/OS (Recommended)"
         echo "      Installs HacknetOS to a designated partition."
@@ -412,34 +551,139 @@ ROOT=""
 if [[ "${INSTALL_MODE}" == "multiboot" ]]; then
     log "Mode: ${GREEN}Multi-Boot / Dual-Boot Installation${RESET}"
 
-    if [[ -z "${TARGET_PART}" ]]; then
+    if [[ -n "${TARGET_PART}" ]]; then
+        MULTIBOOT_ACTION="use_part"
+        [[ -b "${TARGET_PART}" ]] || die "Target partition '${TARGET_PART}' does not exist"
+        ROOT="${TARGET_PART}"
+    elif [[ -n "${RESIZE_PART}" ]]; then
+        MULTIBOOT_ACTION="resize"
+        [[ -b "${RESIZE_PART}" ]] || die "Resize partition '${RESIZE_PART}' does not exist"
+        [[ -n "${RESIZE_MB}" && "${RESIZE_MB}" -ge 4096 ]] || die "HACKNET_RESIZE_MB must be >= 4096 MiB"
+        ROOT="(new partition from shrinking ${RESIZE_PART})"
+    elif [[ "${USE_FREE_SPACE}" == "1" ]]; then
+        MULTIBOOT_ACTION="free_space"
+        [[ "${FREE_GAP_MIB}" -ge 4096 ]] || die "Not enough unallocated free space (need >= 4 GiB, found ${FREE_GAP_MIB} MiB)"
+        ROOT="(new partition in unallocated space)"
+    else
+        # Interactive safe multi-boot chooser: free space, resize existing OS, or format spare partition
+        MB_TYPES=()
+        MB_TARGETS=()
+        MB_MAX_MIB=()
+
         echo
-        log "Select partition for HacknetOS Root (/):"
-        cidx=1
+        log "Install Alongside Options:"
+        mb_idx=1
+        if [[ "${FREE_GAP_MIB}" -ge 4096 ]]; then
+            printf "  [%d] Install into unallocated free space (%d MiB / %.1f GiB available)\n" \
+                "$mb_idx" "${FREE_GAP_MIB}" "$(awk "BEGIN{printf \"%.1f\", ${FREE_GAP_MIB}/1024}")"
+            MB_TYPES+=("free_space")
+            MB_TARGETS+=("${REAL}")
+            MB_MAX_MIB+=("${FREE_GAP_MIB}")
+            ((mb_idx++))
+        fi
+
         for cp in "${CANDIDATE_PARTS[@]}"; do
-            cpsize=$(lsblk -dno SIZE "$cp" 2>/dev/null || echo "")
-            cpfs=$(lsblk -dno FSTYPE "$cp" 2>/dev/null || echo "none")
-            cpos=$(detect_os "$cp")
-            [[ -n "$cpos" ]] && cpos=" - ${cpos}"
-            printf "  [%d] %-14s (%s, %s%s)\n" "$cidx" "$cp" "$cpsize" "$cpfs" "$cpos"
-            ((cidx++))
+            cp_num=$(get_part_num "$cp")
+            cp_fs=$(lsblk -dno FSTYPE "$cp" 2>/dev/null || blkid -s TYPE -o value "$cp" 2>/dev/null || true)
+            cp_os=$(detect_os "$cp")
+            cp_bounds=$(get_part_bounds_mib "${REAL}" "${cp_num}")
+            read -r _s _e cp_size_mib <<< "${cp_bounds}"
+            cp_min_mib=$(get_min_fs_mib "$cp" "$cp_fs")
+            if [[ "${cp_min_mib}" -gt 0 && -n "${cp_size_mib}" ]]; then
+                cp_free_mib=$((cp_size_mib - cp_min_mib))
+                if [[ "${cp_free_mib}" -ge 4096 ]]; then
+                    cp_label="${cp_os:-${cp_fs} partition}"
+                    printf "  [%d] Shrink %-12s (%s, %.1f GiB total, up to %.1f GiB free for HacknetOS)\n" \
+                        "$mb_idx" "$cp" "$cp_label" \
+                        "$(awk "BEGIN{printf \"%.1f\", ${cp_size_mib}/1024}")" \
+                        "$(awk "BEGIN{printf \"%.1f\", ${cp_free_mib}/1024}")"
+                    MB_TYPES+=("resize")
+                    MB_TARGETS+=("$cp")
+                    MB_MAX_MIB+=("${cp_free_mib}")
+                    ((mb_idx++))
+                fi
+            fi
         done
+
+        if [[ ${#CANDIDATE_PARTS[@]} -gt 0 ]]; then
+            printf "  [%d] Format an existing partition directly (overwrites selected partition)\n" "$mb_idx"
+            MB_TYPES+=("use_part")
+            MB_TARGETS+=("")
+            MB_MAX_MIB+=("0")
+            ((mb_idx++))
+        fi
+
+        [[ ${#MB_TYPES[@]} -gt 0 ]] || die "No suitable multi-boot option found on ${REAL}"
         echo
         while true; do
-            read -rp "Select root partition [1-${#CANDIDATE_PARTS[@]}]: " p_choice
-            if [[ "$p_choice" =~ ^[0-9]+$ ]] && [[ "$p_choice" -ge 1 ]] && [[ "$p_choice" -le ${#CANDIDATE_PARTS[@]} ]]; then
-                TARGET_PART="${CANDIDATE_PARTS[$((p_choice-1))]}"
-                break
-            elif [[ -b "$p_choice" ]]; then
-                TARGET_PART="$p_choice"
+            read -rp "Choose install alongside method [1-${#MB_TYPES[@]}] (default 1): " mb_choice
+            mb_choice="${mb_choice:-1}"
+            if [[ "$mb_choice" =~ ^[0-9]+$ ]] && [[ "$mb_choice" -ge 1 ]] && [[ "$mb_choice" -le ${#MB_TYPES[@]} ]]; then
+                sel_idx=$((mb_choice - 1))
+                MULTIBOOT_ACTION="${MB_TYPES[$sel_idx]}"
                 break
             fi
             echo "Invalid selection."
         done
-    fi
 
-    [[ -b "${TARGET_PART}" ]] || die "Target partition '${TARGET_PART}' does not exist"
-    ROOT="${TARGET_PART}"
+        if [[ "${MULTIBOOT_ACTION}" == "free_space" ]]; then
+            ROOT="(new partition in unallocated space)"
+        elif [[ "${MULTIBOOT_ACTION}" == "resize" ]]; then
+            RESIZE_PART="${MB_TARGETS[$sel_idx]}"
+            max_mib="${MB_MAX_MIB[$sel_idx]}"
+            max_gib=$((max_mib / 1024))
+            def_gib=$(( max_gib / 2 ))
+            [[ "$def_gib" -lt 8 && "$max_gib" -ge 8 ]] && def_gib=8
+            [[ "$def_gib" -lt 4 ]] && def_gib=4
+            [[ "$def_gib" -gt "$max_gib" ]] && def_gib="$max_gib"
+            echo
+            while true; do
+                read -rp "Size in GiB to allocate for HacknetOS [4-${max_gib}] (default ${def_gib}): " req_gib
+                req_gib="${req_gib:-$def_gib}"
+                if [[ "$req_gib" =~ ^[0-9]+$ ]] && [[ "$req_gib" -ge 4 ]] && [[ "$req_gib" -le "$max_gib" ]]; then
+                    RESIZE_MB=$((req_gib * 1024))
+                    break
+                fi
+                echo "Please enter a whole number between 4 and ${max_gib}."
+            done
+            ROOT="(new partition from shrinking ${RESIZE_PART} by ${req_gib} GiB)"
+        else
+            echo
+            log "Select existing partition to FORMAT for HacknetOS Root (/):"
+            cidx=1
+            for cp in "${CANDIDATE_PARTS[@]}"; do
+                cpsize=$(lsblk -dno SIZE "$cp" 2>/dev/null || echo "")
+                cpfs=$(lsblk -dno FSTYPE "$cp" 2>/dev/null || echo "none")
+                cpos=$(detect_os "$cp")
+                if [[ -n "$cpos" ]]; then
+                    cpos=" - ${RED}CONTAINS OS: ${cpos}${RESET}"
+                else
+                    cpos=" - empty / spare"
+                fi
+                printf "  [%d] %-14s (%s, %s%b)\n" "$cidx" "$cp" "$cpsize" "$cpfs" "$cpos"
+                ((cidx++))
+            done
+            echo
+            while true; do
+                read -rp "Select root partition [1-${#CANDIDATE_PARTS[@]}]: " p_choice
+                if [[ "$p_choice" =~ ^[0-9]+$ ]] && [[ "$p_choice" -ge 1 ]] && [[ "$p_choice" -le ${#CANDIDATE_PARTS[@]} ]]; then
+                    TARGET_PART="${CANDIDATE_PARTS[$((p_choice-1))]}"
+                    break
+                elif [[ -b "$p_choice" ]]; then
+                    TARGET_PART="$p_choice"
+                    break
+                fi
+                echo "Invalid selection."
+            done
+            sel_os=$(detect_os "${TARGET_PART}")
+            if [[ -n "${sel_os}" && "${sel_os}" != "Linux Swap" ]]; then
+                warn "${TARGET_PART} currently contains '${sel_os}'! Formatting it will ERASE that OS."
+                read -rp "Type YES to confirm erasing ${TARGET_PART}: " confirm_os
+                [[ "${confirm_os}" == "YES" ]] || die "Aborted to preserve ${TARGET_PART}"
+            fi
+            ROOT="${TARGET_PART}"
+        fi
+    fi
 
     if [[ "${FIRMWARE}" == "uefi" ]]; then
         if [[ -n "${DETECTED_ESP}" ]]; then
@@ -552,6 +796,14 @@ if [[ "${INSTALL_MODE}" == "clean" ]]; then
     fi
     mkfs.ext4 -F -L HACKNETOS "${ROOT}"
 else
+    if [[ "${MULTIBOOT_ACTION}" == "resize" ]]; then
+        ROOT=$(shrink_and_create_part "${REAL}" "${RESIZE_PART}" "${RESIZE_MB}")
+        log "Created new HacknetOS root partition: ${ROOT}"
+    elif [[ "${MULTIBOOT_ACTION}" == "free_space" ]]; then
+        log "Creating HacknetOS partition in unallocated space (${FREE_GAP_START}MiB -> ${FREE_GAP_END}MiB)..."
+        ROOT=$(create_part_in_range "${REAL}" "${FREE_GAP_START}" "${FREE_GAP_END}")
+        log "Created new HacknetOS root partition: ${ROOT}"
+    fi
     log "Formatting designated HacknetOS root partition ${ROOT} (ext4)..."
     mkfs.ext4 -F -L HACKNETOS "${ROOT}"
     if [[ "${FIRMWARE}" == "uefi" && -n "${ESP}" ]]; then
