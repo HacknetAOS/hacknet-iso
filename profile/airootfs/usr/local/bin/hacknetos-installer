@@ -144,23 +144,17 @@ launch_gui_installer() {
 }
 
 CURRENT_TTY=$(tty 2>/dev/null || true)
+if [[ -z "${INSTALLER_UI}" && "${ASSUME_YES}" != "1" && -z "${DISK}" && "${CURRENT_TTY}" != /dev/ttyS* ]]; then
+    if grep -qE '(^|[[:space:]])hacknetos\.ui=gui([[:space:]]|$)' /proc/cmdline 2>/dev/null; then
+        INSTALLER_UI="gui"
+    elif grep -qE '(^|[[:space:]])hacknetos\.ui=cli([[:space:]]|$)' /proc/cmdline 2>/dev/null; then
+        INSTALLER_UI="cli"
+    fi
+fi
+
 if [[ "${INSTALLER_UI}" == "gui" ]]; then
     if launch_gui_installer; then
         exit 0
-    fi
-elif [[ -z "${INSTALLER_UI}" && "${ASSUME_YES}" != "1" && -z "${DISK}" && -t 0 && "${CURRENT_TTY}" != /dev/ttyS* ]]; then
-    if [[ -x /usr/local/bin/hacknetos-installer-gui ]] && command -v sway >/dev/null 2>&1; then
-        show_banner
-        printf '\n%bSelect Installation Method:%b\n' "${WHITE}" "${RESET}"
-        printf '  %b[1]%b GUI Installer      %b(Graphical interface)%b\n' "${CYAN}" "${RESET}" "${DIM}" "${RESET}"
-        printf '  %b[2]%b Terminal Installer %b(Text-mode CLI)%b\n\n' "${CYAN}" "${RESET}" "${DIM}" "${RESET}"
-        read -rp "Select method [1-2] (default 1): " _ui_choice
-        _ui_choice="${_ui_choice:-1}"
-        if [[ "${_ui_choice}" == "1" ]]; then
-            if launch_gui_installer; then
-                exit 0
-            fi
-        fi
     fi
 fi
 
