@@ -8,7 +8,7 @@ polkit.addRule(function (action, subject) {
          action.id === "org.freedesktop.login1.power-off-multiple-sessions" ||
          action.id === "org.freedesktop.login1.suspend" ||
          action.id === "org.freedesktop.login1.suspend-multiple-sessions") &&
-        subject.local && subject.isInGroup("wheel")) {
+        (subject.user === "greeter" || (subject.local && subject.isInGroup("wheel")))) {
         return polkit.Result.YES;
     }
 });
