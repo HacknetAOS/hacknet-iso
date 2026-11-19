@@ -36,6 +36,7 @@ pacman -U --noconfirm --overwrite '*' --config /tmp/pacman-offline.conf \
     /var/cache/pacman/pkg/hacknetctl-*.pkg.tar.zst \
     /var/cache/pacman/pkg/hacknet-theme-*.pkg.tar.zst \
     /var/cache/pacman/pkg/hacknet-shell-*.pkg.tar.zst \
+    /var/cache/pacman/pkg/hacknet-settings-*.pkg.tar.zst \
     /var/cache/pacman/pkg/hacknet-os-*.pkg.tar.zst \
     /var/cache/pacman/pkg/yay-*.pkg.tar.zst \
     || fail "could not install the HacknetOS packages"
